@@ -60,7 +60,7 @@ app.post('/annotate', async (req, res) => {
       const pageIndex = field.review.page - 1;
       const page = pages[pageIndex];
       if (!page) {
-        skipped.push(verdict.questionId);
+        skipped.push(`exercise ${verdict.exerciseIndex}, row ${verdict.studentAnswerIndex} (page ${field.review.page} not found - PDF only has ${pages.length} page(s))`);
         continue;
       }
 
@@ -99,7 +99,8 @@ app.post('/annotate', async (req, res) => {
     res.json({
       annotatedPdfBase64: Buffer.from(outBytes).toString('base64'),
       annotatedCount,
-      skipped
+      skipped,
+      pdfPageCount: pages.length
     });
 
   } catch (err) {
