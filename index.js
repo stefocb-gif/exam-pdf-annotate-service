@@ -9,12 +9,35 @@
 // Output: { annotatedPdfBase64 }
 
 const express = require('express');
-const { PDFDocument, rgb } = require('pdf-lib');
+const { PDFDocument, rgb, degrees } = require('pdf-lib');
 
 const app = express();
 
 // Exam PDFs with images can be large - raise the body size limit.
 app.use(express.json({ limit: '25mb' }));
+
+// Scanned exams (especially from office scanners) very often carry a page
+// /Rotate flag (90/180/270) rather than being physically rotated pixels.
+// pdf-lib always draws in the page's RAW, unrotated coordinate space, but
+// DocuPipe's normalized coordinates describe the VISUALLY correct page as
+// a human/OCR sees it. Without this correction, marks land in a rotated,
+// scrambled position relative to the actual visible content.
+//
+// Formulas for 90/270 empirically verified by rendering test PDFs and
+// measuring actual pixel output; 0/180 are standard/analytical.
+function toRawCoords(x1, y1, rawWidth, rawHeight, rotationAngle) {
+  switch (rotationAngle) {
+    case 270:
+      return { x: rawWidth * (1 - y1), y: rawHeight * (1 - x1) };
+    case 90:
+      return { x: rawWidth * y1, y: rawHeight * x1 };
+    case 180:
+      return { x: rawWidth * (1 - x1), y: rawHeight * y1 };
+    case 0:
+    default:
+      return { x: rawWidth * x1, y: rawHeight * (1 - y1) };
+  }
+}
 
 app.get('/', (req, res) => {
   res.send('PDF annotation service is running. POST to /annotate.');
@@ -65,29 +88,42 @@ app.post('/annotate', async (req, res) => {
       }
 
       const { width, height } = page.getSize();
-      const [x1, y1, , y2] = field.review.boundingBoxes[0]; // normalized 0-1
+      const rotationAngle = page.getRotation().angle;
+      const [x1, y1] = field.review.boundingBoxes[0]; // normalized 0-1, top-left origin
 
-      // Convert normalized coordinates to actual page points.
-      // PDF coordinate origin is bottom-left, so we flip the y-axis.
-      const xPos = x1 * width;
-      const yTop = height - (y1 * height);
+      const { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const symbol = verdict.isCorrect ? 'OK' : 'X';
 
+      // Text must be drawn rotated by the SAME angle as the page rotation,
+      // so it appears upright (not sideways/upside-down) once the page's
+      // own rotation is applied for viewing - empirically confirmed.
       page.drawText(symbol, {
-        x: Math.max(xPos - 22, 2),
+        x: xPos,
         y: yTop,
         size: 12,
-        color
+        color,
+        rotate: degrees(rotationAngle)
       });
 
       if (verdict.comment) {
+        // Offset the comment slightly "below" the mark, in the rotated
+        // frame's own sense of down - handled by nudging along whichever
+        // raw axis corresponds to visual-down for this rotation.
+        let commentX = xPos;
+        let commentY = yTop;
+        if (rotationAngle === 270) commentX -= 12;
+        else if (rotationAngle === 90) commentX += 12;
+        else if (rotationAngle === 180) commentY += 12;
+        else commentY -= 12;
+
         page.drawText(verdict.comment, {
-          x: xPos,
-          y: yTop - 12,
+          x: commentX,
+          y: commentY,
           size: 7,
-          color
+          color,
+          rotate: degrees(rotationAngle)
         });
       }
 
