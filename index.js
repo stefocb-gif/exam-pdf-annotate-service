@@ -37,11 +37,23 @@ app.post('/annotate', async (req, res) => {
     let annotatedCount = 0;
     const skipped = [];
 
+    // Real structure: exercises[] -> studentAnswers[] -> {frage, antwort, fall}.
+    // Each verdict identifies a row by BOTH exerciseIndex and studentAnswerIndex.
+    // Mark position is taken from the 'fall' field (the actual graded answer),
+    // falling back to 'antwort' if 'fall' has no coordinate data.
+    const exercises = reviewData.exercises || [];
+
     for (const verdict of verdicts) {
-      const field = reviewData[verdict.questionId];
+      const exercise = exercises[verdict.exerciseIndex];
+      const row = exercise && exercise.studentAnswers && exercise.studentAnswers[verdict.studentAnswerIndex];
+
+      const field = row && (
+        (row.fall && row.fall.review && row.fall.review.boundingBoxes && row.fall.review.boundingBoxes.length > 0 && row.fall) ||
+        (row.antwort && row.antwort.review && row.antwort.review.boundingBoxes && row.antwort.review.boundingBoxes.length > 0 && row.antwort)
+      );
 
       if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
-        skipped.push(verdict.questionId);
+        skipped.push(`exercise ${verdict.exerciseIndex}, row ${verdict.studentAnswerIndex}`);
         continue;
       }
 
