@@ -1,0 +1,16 @@
+{
+  "name": "exam-pdf-annotate-service",
+  "version": "1.0.0",
+  "description": "Tiny HTTP service that draws grading marks onto scanned exam PDFs using pdf-lib, so n8n Cloud can call it via a normal HTTP Request node.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pdf-lib": "^1.17.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
