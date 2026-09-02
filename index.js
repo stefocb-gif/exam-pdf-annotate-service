@@ -60,30 +60,23 @@ app.post('/annotate', async (req, res) => {
     let annotatedCount = 0;
     const skipped = [];
 
-    // Structure is now a FLAT top-level 'answers' array (each entry has its
-    // own exerciseNumber, subPart, frage, antwort, fall - no more nesting).
-    // With highGranularity mode, frage/antwort/fall each get their OWN box
-    // rather than one box for the whole row - prefer 'fall' (the graded
-    // case), falling back to 'antwort' if 'fall' is null/has no coordinates.
+    // Verdicts now target a SPECIFIC field (frage/antwort/fall) per row,
+    // one verdict per gradable part rather than one per whole row.
     const answers = reviewData.answers || [];
 
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
-
-      const field = row && (
-        (row.fall && row.fall.review && row.fall.review.boundingBoxes && row.fall.review.boundingBoxes.length > 0 && row.fall) ||
-        (row.antwort && row.antwort.review && row.antwort.review.boundingBoxes && row.antwort.review.boundingBoxes.length > 0 && row.antwort)
-      );
+      const field = row && row[verdict.field];
 
       if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
-        skipped.push(`answerIndex ${verdict.answerIndex}`);
+        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
         continue;
       }
 
       const pageIndex = field.review.page - 1;
       const page = pages[pageIndex];
       if (!page) {
-        skipped.push(`answerIndex ${verdict.answerIndex} (page ${field.review.page} not found - PDF only has ${pages.length} page(s))`);
+        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (page ${field.review.page} not found - PDF only has ${pages.length} page(s))`);
         continue;
       }
 
@@ -132,17 +125,51 @@ app.post('/annotate', async (req, res) => {
       annotatedCount++;
     }
 
-    // Draw a total score summary on the last page, respecting its rotation too.
+    // Compute a Swiss grade (1-6 scale) from the totals, rounded to the
+    // nearest 0.5 - standard Swiss school convention.
+    function computeSwissGrade(awarded, possible) {
+      if (!possible) return null;
+      const raw = 1 + 5 * (awarded / possible);
+      const rounded = Math.round(raw * 2) / 2;
+      return Math.max(1, Math.min(6, rounded));
+    }
+
+    // Place the total score and computed grade at the ACTUAL 'Punkte'/'Note'
+    // field locations from the schema, if they exist with their own
+    // coordinates - falling back to a corner of the last page otherwise.
     if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
-      const lastPage = pages[pages.length - 1];
-      const lastPageRotation = lastPage.getRotation().angle;
-      const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
-      lastPage.drawText(`Total: ${totalPointsAwarded}/${totalPointsPossible} points`, {
-        x, y,
-        size: 14,
-        color: rgb(0, 0, 0),
-        rotate: degrees(lastPageRotation)
-      });
+      const swissGrade = computeSwissGrade(totalPointsAwarded, totalPointsPossible);
+      const scoreText = `${totalPointsAwarded}P / ${totalPointsPossible}P`;
+      const gradeText = swissGrade !== null ? `${swissGrade}` : '';
+
+      const punkteField = reviewData.totalScore || reviewData.Punkte || reviewData.punkte;
+      const noteField = reviewData.finalGrade || reviewData.Note || reviewData.note;
+
+      function drawAtField(field, text) {
+        if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) return false;
+        const page = pages[field.review.page - 1];
+        if (!page) return false;
+        const { width, height } = page.getSize();
+        const rotationAngle = page.getRotation().angle;
+        const [x1, y1] = field.review.boundingBoxes[0];
+        const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
+        page.drawText(text, { x, y, size: 12, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
+        return true;
+      }
+
+      const punkteDrawn = drawAtField(punkteField, scoreText);
+      const noteDrawn = drawAtField(noteField, gradeText);
+
+      // Fallback: if the specific fields weren't found/positioned, draw a
+      // summary in the corner of the last page instead so the info isn't lost.
+      if (!punkteDrawn || !noteDrawn) {
+        const lastPage = pages[pages.length - 1];
+        const lastPageRotation = lastPage.getRotation().angle;
+        const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
+        lastPage.drawText(`Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, {
+          x, y, size: 14, color: rgb(0, 0, 0), rotate: degrees(lastPageRotation)
+        });
+      }
     }
 
     const outBytes = await pdfDoc.save();
