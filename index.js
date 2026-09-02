@@ -160,9 +160,23 @@ app.post('/annotate', async (req, res) => {
       const punkteDrawn = drawAtField(punkteField, scoreText);
       const noteDrawn = drawAtField(noteField, gradeText);
 
-      // Fallback: if the specific fields weren't found/positioned, draw a
-      // summary in the corner of the last page instead so the info isn't lost.
-      if (!punkteDrawn || !noteDrawn) {
+      // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
+      // OCR'd content yet, so Review may not report coordinates for them.
+      // Try anchoring near known-good fields instead (maxScore/expectedGrade
+      // DO have real values already, so they likely have real coordinates).
+      let anchorFallbackUsed = false;
+      if (!punkteDrawn) {
+        const maxScoreField = reviewData.maxScore;
+        anchorFallbackUsed = drawAtField(maxScoreField, scoreText + '  ');
+      }
+      if (!noteDrawn) {
+        const expectedGradeField = reviewData.expectedGrade;
+        anchorFallbackUsed = drawAtField(expectedGradeField, gradeText + '  ') || anchorFallbackUsed;
+      }
+
+      // Fallback tier 3 (last resort): corner of the last page, so the
+      // total is never silently lost even if no anchor fields exist.
+      if (!punkteDrawn && !noteDrawn && !anchorFallbackUsed) {
         const lastPage = pages[pages.length - 1];
         const lastPageRotation = lastPage.getRotation().angle;
         const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
