@@ -60,15 +60,15 @@ app.post('/annotate', async (req, res) => {
     let annotatedCount = 0;
     const skipped = [];
 
-    // Real structure: exercises[] -> studentAnswers[] -> {frage, antwort, fall}.
-    // Each verdict identifies a row by BOTH exerciseIndex and studentAnswerIndex.
-    // Mark position is taken from the 'fall' field (the actual graded answer),
-    // falling back to 'antwort' if 'fall' has no coordinate data.
-    const exercises = reviewData.exercises || [];
+    // Structure is now a FLAT top-level 'answers' array (each entry has its
+    // own exerciseNumber, subPart, frage, antwort, fall - no more nesting).
+    // With highGranularity mode, frage/antwort/fall each get their OWN box
+    // rather than one box for the whole row - prefer 'fall' (the graded
+    // case), falling back to 'antwort' if 'fall' is null/has no coordinates.
+    const answers = reviewData.answers || [];
 
     for (const verdict of verdicts) {
-      const exercise = exercises[verdict.exerciseIndex];
-      const row = exercise && exercise.studentAnswers && exercise.studentAnswers[verdict.studentAnswerIndex];
+      const row = answers[verdict.answerIndex];
 
       const field = row && (
         (row.fall && row.fall.review && row.fall.review.boundingBoxes && row.fall.review.boundingBoxes.length > 0 && row.fall) ||
@@ -76,14 +76,14 @@ app.post('/annotate', async (req, res) => {
       );
 
       if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
-        skipped.push(`exercise ${verdict.exerciseIndex}, row ${verdict.studentAnswerIndex}`);
+        skipped.push(`answerIndex ${verdict.answerIndex}`);
         continue;
       }
 
       const pageIndex = field.review.page - 1;
       const page = pages[pageIndex];
       if (!page) {
-        skipped.push(`exercise ${verdict.exerciseIndex}, row ${verdict.studentAnswerIndex} (page ${field.review.page} not found - PDF only has ${pages.length} page(s))`);
+        skipped.push(`answerIndex ${verdict.answerIndex} (page ${field.review.page} not found - PDF only has ${pages.length} page(s))`);
         continue;
       }
 
