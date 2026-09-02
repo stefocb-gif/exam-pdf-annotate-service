@@ -66,7 +66,23 @@ app.post('/annotate', async (req, res) => {
 
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
-      const field = row && row[verdict.field];
+
+      // WORKAROUND for a known DocuPipe limitation: when multiple rows share
+      // the exact same text value (e.g. several rows all say "Richtig"),
+      // Review can't tell them apart and gives them all the same coordinates.
+      // For true_false_correction's primary judgment column specifically,
+      // the row's OWN 'frage' (the sentence being judged) is always unique
+      // per row - so we anchor the mark there instead of on the collision-
+      // prone 'antwort' field, while still grading antwort's correctness
+      // normally (this only affects WHERE the mark is drawn, not what was
+      // graded). Do NOT apply this to other exercise types - for
+      // preposition_only, frage is the whole paragraph, not a specific
+      // word, and would be a much worse anchor than antwort itself.
+      const exerciseTypeValue = row && (row.exerciseType && row.exerciseType.value !== undefined ? row.exerciseType.value : row.exerciseType);
+      const usePositionOverride = exerciseTypeValue === 'true_false_correction' && verdict.field === 'antwort' && row.subPart !== 'b';
+      const positionField = usePositionOverride ? 'frage' : verdict.field;
+
+      const field = row && row[positionField];
 
       if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
