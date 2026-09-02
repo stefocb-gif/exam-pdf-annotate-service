@@ -45,7 +45,7 @@ app.get('/', (req, res) => {
 
 app.post('/annotate', async (req, res) => {
   try {
-    const { pdfBase64, reviewData, verdicts } = req.body;
+    const { pdfBase64, reviewData, verdicts, totalPointsAwarded, totalPointsPossible } = req.body;
 
     if (!pdfBase64 || !reviewData || !verdicts) {
       return res.status(400).json({
@@ -94,12 +94,14 @@ app.post('/annotate', async (req, res) => {
       const { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
-      const symbol = verdict.isCorrect ? 'OK' : 'X';
+      const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
+        ? `${verdict.pointsAwarded ?? 0}/${verdict.pointsPossible}P`
+        : (verdict.isCorrect ? 'OK' : 'X');
 
       // Text must be drawn rotated by the SAME angle as the page rotation,
       // so it appears upright (not sideways/upside-down) once the page's
       // own rotation is applied for viewing - empirically confirmed.
-      page.drawText(symbol, {
+      page.drawText(pointsLabel, {
         x: xPos,
         y: yTop,
         size: 12,
@@ -128,6 +130,19 @@ app.post('/annotate', async (req, res) => {
       }
 
       annotatedCount++;
+    }
+
+    // Draw a total score summary on the last page, respecting its rotation too.
+    if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
+      const lastPage = pages[pages.length - 1];
+      const lastPageRotation = lastPage.getRotation().angle;
+      const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
+      lastPage.drawText(`Total: ${totalPointsAwarded}/${totalPointsPossible} points`, {
+        x, y,
+        size: 14,
+        color: rgb(0, 0, 0),
+        rotate: degrees(lastPageRotation)
+      });
     }
 
     const outBytes = await pdfDoc.save();
