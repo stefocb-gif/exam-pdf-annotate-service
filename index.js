@@ -145,9 +145,14 @@ app.post('/annotate', async (req, res) => {
     // of that exercise, approximating "next to the exercise title" since we
     // don't have a dedicated title-coordinate field - the first answer row
     // is the closest reliable anchor we have.
+    function getExerciseNumberValue(row) {
+      const raw = row.exerciseNumber;
+      return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
+    }
+
     if (Array.isArray(subtotals)) {
       for (const sub of subtotals) {
-        const firstRowIndex = answers.findIndex(a => a.exerciseNumber === sub.exerciseNumber);
+        const firstRowIndex = answers.findIndex(a => getExerciseNumberValue(a) === sub.exerciseNumber);
         if (firstRowIndex === -1) continue;
 
         const row = answers[firstRowIndex];
