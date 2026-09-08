@@ -45,7 +45,7 @@ app.get('/', (req, res) => {
 
 app.post('/annotate', async (req, res) => {
   try {
-    const { pdfBase64, reviewData, verdicts, totalPointsAwarded, totalPointsPossible } = req.body;
+    const { pdfBase64, reviewData, verdicts, totalPointsAwarded, totalPointsPossible, subtotals } = req.body;
 
     if (!pdfBase64 || !reviewData || !verdicts) {
       return res.status(400).json({
@@ -139,6 +139,44 @@ app.post('/annotate', async (req, res) => {
       }
 
       annotatedCount++;
+    }
+
+    // Draw a per-exercise subtotal (e.g. "3.5P / 5.0P") near the first row
+    // of that exercise, approximating "next to the exercise title" since we
+    // don't have a dedicated title-coordinate field - the first answer row
+    // is the closest reliable anchor we have.
+    if (Array.isArray(subtotals)) {
+      for (const sub of subtotals) {
+        const firstRowIndex = answers.findIndex(a => a.exerciseNumber === sub.exerciseNumber);
+        if (firstRowIndex === -1) continue;
+
+        const row = answers[firstRowIndex];
+        const anchorField = row.frage || row.antwort || row.fall;
+        if (!anchorField || !anchorField.review || !anchorField.review.boundingBoxes || anchorField.review.boundingBoxes.length === 0) continue;
+
+        const page = pages[anchorField.review.page - 1];
+        if (!page) continue;
+
+        const { width, height } = page.getSize();
+        const rotationAngle = page.getRotation().angle;
+        const [x1, y1] = anchorField.review.boundingBoxes[0];
+        const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
+
+        const subtotalText = `${sub.awarded}P / ${sub.possible}P`;
+        // Nudge up/right of the first row's position, in whichever raw
+        // direction corresponds to visual "above" for this rotation, so it
+        // reads as a heading-level annotation rather than overlapping the row.
+        let subX = x;
+        let subY = y;
+        if (rotationAngle === 270) subX += 40;
+        else if (rotationAngle === 90) subX -= 40;
+        else if (rotationAngle === 180) subY -= 20;
+        else subY += 20;
+
+        page.drawText(subtotalText, {
+          x: subX, y: subY, size: 11, color: rgb(0, 0, 0.6), rotate: degrees(rotationAngle)
+        });
+      }
     }
 
     // Compute a Swiss grade (1-6 scale) from the totals, rounded to the
