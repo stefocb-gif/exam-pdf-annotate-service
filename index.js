@@ -141,18 +141,34 @@ app.post('/annotate', async (req, res) => {
       annotatedCount++;
     }
 
-    // Draw a per-exercise subtotal (e.g. "3.5P / 5.0P") near the first row
-    // of that exercise, approximating "next to the exercise title" since we
-    // don't have a dedicated title-coordinate field - the first answer row
-    // is the closest reliable anchor we have.
+    // Draw a per-sub-part subtotal (e.g. "3.5P / 5.0P") near the first row
+    // of that sub-part, approximating "next to the exercise/sub-part title"
+    // since we don't have a dedicated title-coordinate field - the first
+    // matching answer row is the closest reliable anchor we have.
     function getExerciseNumberValue(row) {
       const raw = row.exerciseNumber;
+      return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
+    }
+    function getSubPartValue(row) {
+      const raw = row.subPart;
       return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
     }
 
     if (Array.isArray(subtotals)) {
       for (const sub of subtotals) {
-        const firstRowIndex = answers.findIndex(a => getExerciseNumberValue(a) === sub.exerciseNumber);
+        // sub.key looks like "1a", "1b", or just "2" (no sub-part letter).
+        const match = String(sub.key).match(/^(\d+)([a-zA-Z]?)$/);
+        if (!match) continue;
+        const [, exNumStr, subPartLetter] = match;
+        const exNum = parseInt(exNumStr, 10);
+
+        const firstRowIndex = answers.findIndex(a => {
+          const rowExNum = getExerciseNumberValue(a);
+          const rowSubPart = getSubPartValue(a);
+          if (rowExNum !== exNum) return false;
+          if (subPartLetter) return rowSubPart === subPartLetter;
+          return !rowSubPart; // no letter in key means match rows with no subPart
+        });
         if (firstRowIndex === -1) continue;
 
         const row = answers[firstRowIndex];
@@ -167,7 +183,8 @@ app.post('/annotate', async (req, res) => {
         const [x1, y1] = anchorField.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
 
-        const subtotalText = `${sub.awarded}P / ${sub.possible}P`;
+        const possibleText = sub.possible !== null && sub.possible !== undefined ? sub.possible : '?';
+        const subtotalText = `${sub.awarded}P / ${possibleText}P`;
         let subX = x;
         let subY = y;
         if (rotationAngle === 270) subX += 40;
