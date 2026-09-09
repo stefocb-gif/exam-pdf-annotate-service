@@ -218,7 +218,7 @@ app.post('/annotate', async (req, res) => {
       const punkteField = reviewData.totalScore || reviewData.Punkte || reviewData.punkte;
       const noteField = reviewData.finalGrade || reviewData.Note || reviewData.note;
 
-      function drawAtField(field, text) {
+      function drawAtField(field, text, yNudge) {
         if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) return false;
         const page = pages[field.review.page - 1];
         if (!page) return false;
@@ -226,25 +226,29 @@ app.post('/annotate', async (req, res) => {
         const rotationAngle = page.getRotation().angle;
         const [x1, y1] = field.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
-        page.drawText(text, { x, y, size: 12, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
+        page.drawText(text, { x, y: y + (yNudge || 0), size: 12, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
         return true;
       }
 
-      const punkteDrawn = drawAtField(punkteField, scoreText);
-      const noteDrawn = drawAtField(noteField, gradeText);
+      const punkteDrawn = drawAtField(punkteField, scoreText, 0);
+      const noteDrawn = drawAtField(noteField, gradeText, 0);
 
       // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
       // OCR'd content yet, so Review may not report coordinates for them.
       // Try anchoring near known-good fields instead (maxScore/expectedGrade
       // DO have real values already, so they likely have real coordinates).
+      // Nudge down slightly (-8) since these anchor fields' own boxes likely
+      // represent the TOP of their text, while drawText positions by
+      // baseline - using the raw coordinate directly renders noticeably
+      // higher than the original text visually sat.
       let anchorFallbackUsed = false;
       if (!punkteDrawn) {
         const maxScoreField = reviewData.maxScore;
-        anchorFallbackUsed = drawAtField(maxScoreField, scoreText + '  ');
+        anchorFallbackUsed = drawAtField(maxScoreField, scoreText + '  ', -8);
       }
       if (!noteDrawn) {
         const expectedGradeField = reviewData.expectedGrade;
-        anchorFallbackUsed = drawAtField(expectedGradeField, gradeText + '  ') || anchorFallbackUsed;
+        anchorFallbackUsed = drawAtField(expectedGradeField, gradeText + '  ', -8) || anchorFallbackUsed;
       }
 
       // Fallback tier 3 (last resort): corner of the last page, so the
