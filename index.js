@@ -256,15 +256,16 @@ app.post('/annotate', async (req, res) => {
       // cleanly within it. Also nudge down slightly (-8) to compensate for
       // baseline-vs-top coordinate mismatch (established earlier).
       //
-      // IMPORTANT: these offsets were empirically tuned for rotation=270
-      // (the original exam's scanned, rotated documents) - applying the
-      // SAME fixed offset blindly to a different rotation (e.g. a
-      // digitally-created PDF with rotation=0) can send text in a totally
-      // wrong direction, since a raw-space offset means something different
-      // depending on rotation. To avoid guessing a new offset for every new
-      // document type, only apply the tested offset for rotation=270 -
-      // otherwise draw directly at the anchor with no offset, which is safe
-      // (if imprecise) rather than risking a wildly wrong position.
+      // IMPORTANT: this anchor-based fallback was empirically tuned and
+      // validated ONLY for rotation=270 (the original exam's scanned,
+      // rotated documents). For any other rotation, we've now confirmed
+      // (via direct testing) that even a zero-offset placement at the
+      // anchor's own coordinate can land far from where the field visually
+      // sits - suggesting the coordinate itself may be imprecise for this
+      // field/schema, not just an offset-direction problem. Rather than
+      // keep guessing at fixes for a source coordinate we can't verify,
+      // skip this fallback entirely for untested rotations and go straight
+      // to the reliable last-resort corner placement below.
       function getFieldRotation(field) {
         if (!field || !field.review || !field.review.page) return null;
         const page = pages[field.review.page - 1];
@@ -276,21 +277,17 @@ app.post('/annotate', async (req, res) => {
       const maxScoreRotation = getFieldRotation(maxScoreField);
       const isTestedRotation = maxScoreRotation === 270;
 
-      if (!punkteDrawn) {
-        anchorFallbackUsed = isTestedRotation
-          ? drawAtField(maxScoreField, scoreText, -8, -70)
-          : drawAtField(maxScoreField, scoreText, 0, 0);
+      if (!punkteDrawn && isTestedRotation) {
+        anchorFallbackUsed = drawAtField(maxScoreField, scoreText, -8, -70);
       }
       if (!noteDrawn) {
         const expectedGradeField = reviewData.expectedGrade;
         let drawn = drawAtField(expectedGradeField, gradeText + '  ', -8, 0);
         // No dedicated grade-anchor field exists in this schema at all (or
         // it's blank with no coordinates) - reuse the SAME maxScore/maxPoints
-        // anchor as a last resort.
-        if (!drawn) {
-          drawn = isTestedRotation
-            ? drawAtField(maxScoreField, gradeText, -28, 0)
-            : drawAtField(maxScoreField, gradeText, -14, 0);
+        // anchor as a last resort, ONLY for the validated rotation.
+        if (!drawn && isTestedRotation) {
+          drawn = drawAtField(maxScoreField, gradeText, -28, 0);
         }
         anchorFallbackUsed = drawn || anchorFallbackUsed;
       }
