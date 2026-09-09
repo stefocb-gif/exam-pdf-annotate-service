@@ -100,7 +100,19 @@ app.post('/annotate', async (req, res) => {
       const rotationAngle = page.getRotation().angle;
       const [x1, y1] = field.review.boundingBoxes[0]; // normalized 0-1, top-left origin
 
-      const { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
+      const { x: xPosRaw, y: yTopRaw } = toRawCoords(x1, y1, width, height, rotationAngle);
+
+      // Nudge the mark slightly toward the visual "above" the answer, so it
+      // doesn't sit directly on top of the handwriting - same directional
+      // convention already established for rotation handling elsewhere in
+      // this file, just a smaller magnitude suited to a subtle nudge rather
+      // than a full separate placement.
+      let xPos = xPosRaw;
+      let yTop = yTopRaw;
+      if (rotationAngle === 270) xPos += 14;
+      else if (rotationAngle === 90) xPos -= 14;
+      else if (rotationAngle === 180) yTop -= 14;
+      else yTop += 14;
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
@@ -219,7 +231,7 @@ app.post('/annotate', async (req, res) => {
       const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
       const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
 
-      function drawAtField(field, text, yNudge) {
+      function drawAtField(field, text, yNudge, xNudge) {
         if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) return false;
         const page = pages[field.review.page - 1];
         if (!page) return false;
@@ -227,29 +239,41 @@ app.post('/annotate', async (req, res) => {
         const rotationAngle = page.getRotation().angle;
         const [x1, y1] = field.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
-        page.drawText(text, { x, y: y + (yNudge || 0), size: 12, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
+        page.drawText(text, { x: x + (xNudge || 0), y: y + (yNudge || 0), size: 12, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
         return true;
       }
 
-      const punkteDrawn = drawAtField(punkteField, scoreText, 0);
-      const noteDrawn = drawAtField(noteField, gradeText, 0);
+      const punkteDrawn = drawAtField(punkteField, scoreText, 0, 0);
+      const noteDrawn = drawAtField(noteField, gradeText, 0, 0);
 
       // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
       // OCR'd content yet, so Review may not report coordinates for them.
-      // Try anchoring near known-good fields instead (maxScore/expectedGrade
-      // DO have real values already, so they likely have real coordinates).
-      // Nudge down slightly (-8) since these anchor fields' own boxes likely
-      // represent the TOP of their text, while drawText positions by
-      // baseline - using the raw coordinate directly renders noticeably
-      // higher than the original text visually sat.
+      // Try anchoring near known-good fields instead (maxScore/maxPoints DO
+      // have real values already, so they likely have real coordinates).
+      // Nudge LEFT (-70) since these anchor fields' own position typically
+      // sits at the END of a "/ 15" style label - drawing our text directly
+      // there pushes it further right, past the box, rather than starting
+      // cleanly within it. Also nudge down slightly (-8) to compensate for
+      // baseline-vs-top coordinate mismatch (established earlier).
       let anchorFallbackUsed = false;
+      const maxScoreField = reviewData.maxScore || reviewData.maxPoints;
       if (!punkteDrawn) {
-        const maxScoreField = reviewData.maxScore || reviewData.maxPoints;
-        anchorFallbackUsed = drawAtField(maxScoreField, scoreText + '  ', -8);
+        anchorFallbackUsed = drawAtField(maxScoreField, scoreText, -8, -70);
       }
       if (!noteDrawn) {
-        const expectedGradeField = reviewData.expectedGrade || reviewData.grade;
-        anchorFallbackUsed = drawAtField(expectedGradeField, gradeText + '  ', -8) || anchorFallbackUsed;
+        const expectedGradeField = reviewData.expectedGrade;
+        let drawn = drawAtField(expectedGradeField, gradeText + '  ', -8, 0);
+        // No dedicated grade-anchor field exists in this schema at all (or
+        // it's blank with no coordinates) - reuse the SAME maxScore/maxPoints
+        // anchor as a last resort, offset DOWN (not sideways - a horizontal
+        // offset risks pushing off-page depending on rotation direction and
+        // how close the anchor sits to a page edge, while a vertical offset
+        // from an already-validated anchor is safer) so it doesn't collide
+        // with the score text drawn from that same anchor.
+        if (!drawn) {
+          drawn = drawAtField(maxScoreField, gradeText, -28, 0);
+        }
+        anchorFallbackUsed = drawn || anchorFallbackUsed;
       }
 
       // Fallback tier 3 (last resort): corner of the last page, so the
