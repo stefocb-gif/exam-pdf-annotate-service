@@ -157,6 +157,13 @@ app.post('/annotate', async (req, res) => {
     // of that sub-part, approximating "next to the exercise/sub-part title"
     // since we don't have a dedicated title-coordinate field - the first
     // matching answer row is the closest reliable anchor we have.
+    //
+    // IMPORTANT: this feature's positioning has only been validated for
+    // rotation=270 (the original exam's scanned documents). On other
+    // layouts (e.g. digitally-created PDFs), subtotals have landed in
+    // unreliable/wrong positions - rather than keep guessing at fixes,
+    // this is disabled entirely for untested rotations. Individual
+    // per-answer marks and the final total/grade are unaffected.
     function getExerciseNumberValue(row) {
       const raw = row.exerciseNumber;
       return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
@@ -166,7 +173,10 @@ app.post('/annotate', async (req, res) => {
       return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
     }
 
-    if (Array.isArray(subtotals)) {
+    const documentRotation = pages.length > 0 ? pages[0].getRotation().angle : null;
+    const subtotalsValidatedForThisDocument = documentRotation === 270;
+
+    if (Array.isArray(subtotals) && subtotalsValidatedForThisDocument) {
       for (const sub of subtotals) {
         // sub.key looks like "1a", "1b", or just "2" (no sub-part letter).
         const match = String(sub.key).match(/^(\d+)([a-zA-Z]?)$/);
