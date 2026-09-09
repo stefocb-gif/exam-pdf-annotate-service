@@ -165,7 +165,7 @@ app.post('/annotate', async (req, res) => {
         const firstRowIndex = answers.findIndex(a => {
           const rowExNum = getExerciseNumberValue(a);
           const rowSubPart = getSubPartValue(a);
-          if (rowExNum !== exNum) return false;
+          if (String(rowExNum) !== String(exNum)) return false;
           if (subPartLetter === 'a') return rowSubPart === 'a' || !rowSubPart; // null/undefined subPart defaults to 'a' by convention (matches node 21 and the true_false_correction template)
           if (subPartLetter) return rowSubPart === subPartLetter;
           return !rowSubPart; // no letter in key means match rows with no subPart
@@ -216,8 +216,8 @@ app.post('/annotate', async (req, res) => {
       const scoreText = `${totalPointsAwarded}P / ${totalPointsPossible}P`;
       const gradeText = swissGrade !== null ? `${swissGrade}` : '';
 
-      const punkteField = reviewData.totalScore || reviewData.Punkte || reviewData.punkte;
-      const noteField = reviewData.finalGrade || reviewData.Note || reviewData.note;
+      const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
+      const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
 
       function drawAtField(field, text, yNudge) {
         if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) return false;
@@ -244,11 +244,11 @@ app.post('/annotate', async (req, res) => {
       // higher than the original text visually sat.
       let anchorFallbackUsed = false;
       if (!punkteDrawn) {
-        const maxScoreField = reviewData.maxScore;
+        const maxScoreField = reviewData.maxScore || reviewData.maxPoints;
         anchorFallbackUsed = drawAtField(maxScoreField, scoreText + '  ', -8);
       }
       if (!noteDrawn) {
-        const expectedGradeField = reviewData.expectedGrade;
+        const expectedGradeField = reviewData.expectedGrade || reviewData.grade;
         anchorFallbackUsed = drawAtField(expectedGradeField, gradeText + '  ', -8) || anchorFallbackUsed;
       }
 
