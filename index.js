@@ -166,6 +166,7 @@ app.post('/annotate', async (req, res) => {
           const rowExNum = getExerciseNumberValue(a);
           const rowSubPart = getSubPartValue(a);
           if (rowExNum !== exNum) return false;
+          if (subPartLetter === 'a') return rowSubPart === 'a' || !rowSubPart; // null/undefined subPart defaults to 'a' by convention (matches node 21 and the true_false_correction template)
           if (subPartLetter) return rowSubPart === subPartLetter;
           return !rowSubPart; // no letter in key means match rows with no subPart
         });
