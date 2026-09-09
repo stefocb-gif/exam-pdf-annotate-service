@@ -255,23 +255,42 @@ app.post('/annotate', async (req, res) => {
       // there pushes it further right, past the box, rather than starting
       // cleanly within it. Also nudge down slightly (-8) to compensate for
       // baseline-vs-top coordinate mismatch (established earlier).
+      //
+      // IMPORTANT: these offsets were empirically tuned for rotation=270
+      // (the original exam's scanned, rotated documents) - applying the
+      // SAME fixed offset blindly to a different rotation (e.g. a
+      // digitally-created PDF with rotation=0) can send text in a totally
+      // wrong direction, since a raw-space offset means something different
+      // depending on rotation. To avoid guessing a new offset for every new
+      // document type, only apply the tested offset for rotation=270 -
+      // otherwise draw directly at the anchor with no offset, which is safe
+      // (if imprecise) rather than risking a wildly wrong position.
+      function getFieldRotation(field) {
+        if (!field || !field.review || !field.review.page) return null;
+        const page = pages[field.review.page - 1];
+        return page ? page.getRotation().angle : null;
+      }
+
       let anchorFallbackUsed = false;
       const maxScoreField = reviewData.maxScore || reviewData.maxPoints;
+      const maxScoreRotation = getFieldRotation(maxScoreField);
+      const isTestedRotation = maxScoreRotation === 270;
+
       if (!punkteDrawn) {
-        anchorFallbackUsed = drawAtField(maxScoreField, scoreText, -8, -70);
+        anchorFallbackUsed = isTestedRotation
+          ? drawAtField(maxScoreField, scoreText, -8, -70)
+          : drawAtField(maxScoreField, scoreText, 0, 0);
       }
       if (!noteDrawn) {
         const expectedGradeField = reviewData.expectedGrade;
         let drawn = drawAtField(expectedGradeField, gradeText + '  ', -8, 0);
         // No dedicated grade-anchor field exists in this schema at all (or
         // it's blank with no coordinates) - reuse the SAME maxScore/maxPoints
-        // anchor as a last resort, offset DOWN (not sideways - a horizontal
-        // offset risks pushing off-page depending on rotation direction and
-        // how close the anchor sits to a page edge, while a vertical offset
-        // from an already-validated anchor is safer) so it doesn't collide
-        // with the score text drawn from that same anchor.
+        // anchor as a last resort.
         if (!drawn) {
-          drawn = drawAtField(maxScoreField, gradeText, -28, 0);
+          drawn = isTestedRotation
+            ? drawAtField(maxScoreField, gradeText, -28, 0)
+            : drawAtField(maxScoreField, gradeText, -14, 0);
         }
         anchorFallbackUsed = drawn || anchorFallbackUsed;
       }
