@@ -21,7 +21,7 @@ const SHOW_COMMENTS = false;
 // positioning proved unreliable on some documents regardless of rotation,
 // so this is now a simple explicit on/off switch rather than an inferred
 // per-document decision.
-const SHOW_SUBTOTALS = false;
+const SHOW_SUBTOTALS = true;
 
 const app = express();
 
