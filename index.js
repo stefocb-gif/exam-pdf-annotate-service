@@ -9,7 +9,7 @@
 // Output: { annotatedPdfBase64 }
 
 const express = require('express');
-const { PDFDocument, rgb, degrees } = require('pdf-lib');
+const { PDFDocument, rgb, degrees, StandardFonts } = require('pdf-lib');
 
 // TOGGLE: set to true to re-enable the small explanatory comment text under
 // each mark (e.g. "Korrekte Option gewählt"). Currently off by request -
@@ -72,6 +72,21 @@ app.post('/annotate', async (req, res) => {
     const pdfBytes = Buffer.from(pdfBase64, 'base64');
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const pages = pdfDoc.getPages();
+    // Embedded once so we can measure real text width (needed to right-align
+    // labels precisely, rather than guessing a character-count estimate).
+    const labelFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+    // Shifts a point by `distance` along the SAME direction text would be
+    // drawn when rotated by `rotationAngle` (matches pdf-lib's own rotate
+    // behavior for drawText). Used to right-align a label of known pixel
+    // width so it always ENDS at a fixed anchor point, regardless of how
+    // long the label text is or which page rotation it's on - a negative
+    // distance moves the label's start point backward (left, in the
+    // rotated frame's own sense) by that many pixels.
+    function shiftAlongTextDirection(x, y, distance, rotationAngle) {
+      const rad = (rotationAngle * Math.PI) / 180;
+      return { x: x + distance * Math.cos(rad), y: y + distance * Math.sin(rad) };
+    }
 
     let annotatedCount = 0;
     const skipped = [];
@@ -201,12 +216,24 @@ app.post('/annotate', async (req, res) => {
         ? `${verdict.pointsAwarded ?? 0}/${verdict.pointsPossible}P`
         : (verdict.isCorrect ? 'OK' : 'X');
 
-      // Draw a white background rectangle behind the score text first, so
-      // it stays readable against busy handwriting/highlighting underneath -
-      // sized generously based on character count (avoids needing precise
-      // font-metric measurement for a simple readability improvement).
+      // Right-align the label so it always ENDS at the right-margin column
+      // (RIGHT_MARGIN_X_FRACTION), rather than starting there. This is what
+      // actually fixes the page-edge overflow: a left-aligned "0.5/0.5P"
+      // (this exam's decimal scoring) is nearly twice as wide as "1/1P" was
+      // on the previous exam, so a fixed START position let longer labels
+      // run past the page edge. Right-aligning means the label's length no
+      // longer matters - only its END position does, and that's fixed.
       const labelFontSize = MARK_FONT_SIZE;
-      const estimatedWidth = pointsLabel.length * labelFontSize * 0.52;
+      const textWidth = labelFont.widthOfTextAtSize(pointsLabel, labelFontSize);
+      const rightAligned = shiftAlongTextDirection(xPos, yTop, -textWidth, rotationAngle);
+      xPos = rightAligned.x;
+      yTop = rightAligned.y;
+
+      // Draw a white background rectangle behind the score text first, so
+      // it stays readable against busy handwriting/highlighting underneath.
+      // Now sized from the SAME real font-measured width used for
+      // right-alignment above, rather than a rough character-count guess.
+      const estimatedWidth = textWidth + 4;
       const estimatedHeight = labelFontSize * 1.15;
       page.drawRectangle({
         x: xPos - 2,
@@ -224,6 +251,7 @@ app.post('/annotate', async (req, res) => {
         x: xPos,
         y: yTop,
         size: labelFontSize,
+        font: labelFont,
         color,
         rotate: degrees(rotationAngle)
       });
