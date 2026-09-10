@@ -121,10 +121,10 @@ app.post('/annotate', async (req, res) => {
       // than a full separate placement.
       let xPos = xPosRaw;
       let yTop = yTopRaw;
-      if (rotationAngle === 270) xPos += 14;
-      else if (rotationAngle === 90) xPos -= 14;
-      else if (rotationAngle === 180) yTop -= 14;
-      else yTop += 14;
+      if (rotationAngle === 270) xPos += 26;
+      else if (rotationAngle === 90) xPos -= 26;
+      else if (rotationAngle === 180) yTop -= 26;
+      else yTop += 26;
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
@@ -136,7 +136,7 @@ app.post('/annotate', async (req, res) => {
       // sized generously based on character count (avoids needing precise
       // font-metric measurement for a simple readability improvement).
       const labelFontSize = 14;
-      const estimatedWidth = pointsLabel.length * labelFontSize * 0.62;
+      const estimatedWidth = pointsLabel.length * labelFontSize * 0.52;
       const estimatedHeight = labelFontSize * 1.15;
       page.drawRectangle({
         x: xPos - 2,
