@@ -11,6 +11,11 @@
 const express = require('express');
 const { PDFDocument, rgb, degrees } = require('pdf-lib');
 
+// TOGGLE: set to true to re-enable the small explanatory comment text under
+// each mark (e.g. "Korrekte Option gewählt"). Currently off by request -
+// only the score itself (e.g. "1/1P") is shown, not the reasoning behind it.
+const SHOW_COMMENTS = false;
+
 const app = express();
 
 // Exam PDFs with images can be large - raise the body size limit.
@@ -130,7 +135,7 @@ app.post('/annotate', async (req, res) => {
         rotate: degrees(rotationAngle)
       });
 
-      if (verdict.comment) {
+      if (SHOW_COMMENTS && verdict.comment) {
         // Offset the comment slightly "below" the mark, in the rotated
         // frame's own sense of down - handled by nudging along whichever
         // raw axis corresponds to visual-down for this rotation.
