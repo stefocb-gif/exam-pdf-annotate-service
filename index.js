@@ -16,6 +16,13 @@ const { PDFDocument, rgb, degrees } = require('pdf-lib');
 // only the score itself (e.g. "1/1P") is shown, not the reasoning behind it.
 const SHOW_COMMENTS = false;
 
+// TOGGLE: set to true to re-enable per-exercise/sub-part subtotal display
+// (e.g. "3.5P / 5.0P" near an exercise heading). Currently off by request -
+// positioning proved unreliable on some documents regardless of rotation,
+// so this is now a simple explicit on/off switch rather than an inferred
+// per-document decision.
+const SHOW_SUBTOTALS = false;
+
 const app = express();
 
 // Exam PDFs with images can be large - raise the body size limit.
@@ -124,13 +131,29 @@ app.post('/annotate', async (req, res) => {
         ? `${verdict.pointsAwarded ?? 0}/${verdict.pointsPossible}P`
         : (verdict.isCorrect ? 'OK' : 'X');
 
+      // Draw a white background rectangle behind the score text first, so
+      // it stays readable against busy handwriting/highlighting underneath -
+      // sized generously based on character count (avoids needing precise
+      // font-metric measurement for a simple readability improvement).
+      const labelFontSize = 14;
+      const estimatedWidth = pointsLabel.length * labelFontSize * 0.62;
+      const estimatedHeight = labelFontSize * 1.15;
+      page.drawRectangle({
+        x: xPos - 2,
+        y: yTop - 3,
+        width: estimatedWidth,
+        height: estimatedHeight,
+        color: rgb(1, 1, 1),
+        rotate: degrees(rotationAngle)
+      });
+
       // Text must be drawn rotated by the SAME angle as the page rotation,
       // so it appears upright (not sideways/upside-down) once the page's
       // own rotation is applied for viewing - empirically confirmed.
       page.drawText(pointsLabel, {
         x: xPos,
         y: yTop,
-        size: 12,
+        size: labelFontSize,
         color,
         rotate: degrees(rotationAngle)
       });
@@ -178,8 +201,7 @@ app.post('/annotate', async (req, res) => {
       return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
     }
 
-    const documentRotation = pages.length > 0 ? pages[0].getRotation().angle : null;
-    const subtotalsValidatedForThisDocument = documentRotation === 270;
+    const subtotalsValidatedForThisDocument = SHOW_SUBTOTALS;
 
     if (Array.isArray(subtotals) && subtotalsValidatedForThisDocument) {
       for (const sub of subtotals) {
