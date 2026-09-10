@@ -96,6 +96,26 @@ app.post('/annotate', async (req, res) => {
     const rowMarkCounts = {};
     const STACK_STEP = 18; // vertical spacing (px) between stacked marks on the same row
 
+    // Separate from the same-row stacking above: consecutive DIFFERENT rows
+    // can also sit close enough together in the original document (e.g.
+    // sub-items i./ii./iii. of a fill-in-the-blank list) that their
+    // independently-anchored marks visually collide. This tracks the last
+    // mark's position per page and nudges the next one further apart if it
+    // would otherwise land within MIN_MARK_GAP of the previous one.
+    const lastMarkAxisByPage = {};
+    const MIN_MARK_GAP = 20; // minimum px between consecutive marks, regardless of which row they belong to
+
+    // Returns a single number that increases as you move visually "down"
+    // the page, regardless of rotation - reuses the same per-rotation axis
+    // convention already established elsewhere in this file (see the
+    // stacking and comment-offset logic below).
+    function visualDownAxis(x, y, rotationAngle) {
+      if (rotationAngle === 270) return -x;
+      if (rotationAngle === 90) return x;
+      if (rotationAngle === 180) return y;
+      return -y;
+    }
+
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
 
@@ -159,6 +179,22 @@ app.post('/annotate', async (req, res) => {
         else if (rotationAngle === 180) yTop += stackOffset;
         else yTop -= stackOffset;
       }
+
+      // Cross-row collision check: if this mark would land within
+      // MIN_MARK_GAP of the previous mark drawn on this page (e.g. tightly
+      // stacked sub-items like i./ii./iii.), push it further down until
+      // there's enough visual separation.
+      let axis = visualDownAxis(xPos, yTop, rotationAngle);
+      const lastAxis = lastMarkAxisByPage[pageIndex];
+      if (lastAxis !== undefined && axis - lastAxis < MIN_MARK_GAP) {
+        const deficit = MIN_MARK_GAP - (axis - lastAxis);
+        if (rotationAngle === 270) xPos -= deficit;
+        else if (rotationAngle === 90) xPos += deficit;
+        else if (rotationAngle === 180) yTop += deficit;
+        else yTop -= deficit;
+        axis = visualDownAxis(xPos, yTop, rotationAngle);
+      }
+      lastMarkAxisByPage[pageIndex] = axis;
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
