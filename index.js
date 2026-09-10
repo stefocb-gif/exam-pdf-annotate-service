@@ -293,14 +293,34 @@ app.post('/annotate', async (req, res) => {
 
     let headerFieldsDebug = null;
 
-    // Place the total score and computed grade relative to the reliable
-    // 'maxScore'/'maxPoints' ("/15") and 'expectedGrade' ("5.5") anchors,
-    // rather than the 'totalScore'/'Punkte'/'finalGrade'/'Note' fields
-    // themselves - those are blank-to-be-filled fields whose coordinates
-    // have proven unreliable on this template (same category of issue as
-    // the antwort-field imprecision seen elsewhere), while maxScore/
-    // expectedGrade already hold real pre-filled values and therefore real,
-    // trustworthy coordinates.
+    // Place the total score and computed grade using FIXED, hardcoded
+    // page-relative coordinates for this exam's header row, rather than any
+    // DocuPipe field coordinate.
+    //
+    // WHY: real-world debug data confirmed that every candidate field
+    // (totalScore, Punkte, finalGrade, Note, expectedGrade, etc.) has NO
+    // coordinates at all on this document, and the one field that DOES have
+    // a coordinate ('maxPoints') points to the instructions paragraph, not
+    // to where "/15" is actually printed in the header table - i.e. it's a
+    // genuinely wrong coordinate, not just an offset that needs tuning. No
+    // amount of nudging a wrong anchor produces a right position.
+    //
+    // Since this exam type is always the same static "TEST A" template
+    // (same header layout on every student's copy), fixed normalized
+    // coordinates are more reliable here than any DocuPipe field - this is
+    // effectively treating the header as a known print-shop form field
+    // rather than something to be located dynamically.
+    //
+    // FIRST-PASS TUNING: these four numbers are a starting estimate from
+    // visually inspecting the header layout, not yet confirmed pixel-exact.
+    // If placement is off after this run, these are the only numbers that
+    // need adjusting - everything else (rotation handling, etc.) stays put.
+    const HEADER_PAGE_INDEX = 0;   // header is always on page 1 for this template
+    const PUNKTE_X_FRACTION = 0.665; // gap between "Punkte:" and "/15"
+    const PUNKTE_Y_FRACTION = 0.055; // vertical position of the header row
+    const NOTE_X_FRACTION = 0.895;   // just right of the "Note:" label
+    const NOTE_Y_FRACTION = 0.055;   // same header row height
+
     if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
       const swissGrade = computeSwissGrade(totalPointsAwarded, totalPointsPossible);
       // Just the awarded number - "/15" is already pre-printed on the form,
@@ -308,52 +328,33 @@ app.post('/annotate', async (req, res) => {
       const scoreText = `${totalPointsAwarded}P`;
       const gradeText = swissGrade !== null ? `${swissGrade}` : '';
 
-      function drawAtField(field, text, yNudge, xNudge, fontSize) {
-        if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) return false;
-        const page = pages[field.review.page - 1];
-        if (!page) return false;
-        const { width, height } = page.getSize();
-        const rotationAngle = page.getRotation().angle;
-        const [x1, y1] = field.review.boundingBoxes[0];
-        const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
-        page.drawText(text, { x: x + (xNudge || 0), y: y + (yNudge || 0), size: fontSize || MARK_FONT_SIZE, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
-        return true;
-      }
+      const headerPage = pages[HEADER_PAGE_INDEX];
+      let punkteDrawn = false;
+      let noteDrawn = false;
 
-      // "Punkte: ___ / 15" - anchor on the "/15" value itself, then nudge
-      // LEFT into the gap before it.
-      // FIRST-PASS TUNING (not yet visually confirmed): -55 was picked to
-      // roughly clear a short "13P"-sized label at MARK_FONT_SIZE - expect
-      // to adjust this one number after seeing the result.
-      const maxScoreField = reviewData.maxScore || reviewData.maxPoints;
-      let punkteDrawn = drawAtField(maxScoreField, scoreText, -3, -55, MARK_FONT_SIZE);
-      if (!punkteDrawn) {
-        // Fall back to the field's own reported coordinate, in case a future
-        // document/template actually has a real one.
-        const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
-        punkteDrawn = drawAtField(punkteField, scoreText, 0, 0, MARK_FONT_SIZE);
-      }
+      if (headerPage) {
+        const { width, height } = headerPage.getSize();
+        const rotationAngle = headerPage.getRotation().angle;
 
-      // "Note: ___" - the direct field (finalGrade/grade/Note/note) is the one
-      // PROVEN to have a usable coordinate on this template (it's what drew
-      // "5.5" successfully before this change) - try it FIRST, now with a
-      // rightward nudge to clear the "Note:" label, and only fall back to
-      // expectedGrade if it's genuinely missing.
-      // FIRST-PASS TUNING: +55 x is a starting guess for clearing the label
-      // width - may still need a small adjustment.
-      const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
-      let noteDrawn = drawAtField(noteField, gradeText, 0, 55, MARK_FONT_SIZE);
-      if (!noteDrawn) {
-        const expectedGradeField = reviewData.expectedGrade;
-        noteDrawn = drawAtField(expectedGradeField, gradeText, -8, 55, MARK_FONT_SIZE);
+        const punktePos = toRawCoords(PUNKTE_X_FRACTION, PUNKTE_Y_FRACTION, width, height, rotationAngle);
+        headerPage.drawText(scoreText, {
+          x: punktePos.x, y: punktePos.y, size: MARK_FONT_SIZE, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle)
+        });
+        punkteDrawn = true;
+
+        if (gradeText) {
+          const notePos = toRawCoords(NOTE_X_FRACTION, NOTE_Y_FRACTION, width, height, rotationAngle);
+          headerPage.drawText(gradeText, {
+            x: notePos.x, y: notePos.y, size: MARK_FONT_SIZE, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle)
+          });
+          noteDrawn = true;
+        }
       }
 
       // DEBUG: this doesn't affect what's drawn on the PDF - it just reports
       // the raw coordinates (if any) for every candidate header field, so we
-      // can see exactly what DocuPipe actually returned instead of guessing
-      // at offsets blindly. Check the 'headerFieldsDebug' key in this
-      // service's JSON response after a run - remove this block once the
-      // header positioning is confirmed correct.
+      // can see exactly what DocuPipe actually returned. Kept for reference
+      // in case a future exam template needs field-based positioning again.
       function describeField(field) {
         if (!field) return null;
         if (!field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
