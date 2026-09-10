@@ -23,6 +23,10 @@ const SHOW_COMMENTS = false;
 // per-document decision.
 const SHOW_SUBTOTALS = false;
 
+// Font size used for every score mark drawn on the page - per-question marks
+// and the header total/grade both use this, so they always match visually.
+const MARK_FONT_SIZE = 14;
+
 const app = express();
 
 // Exam PDFs with images can be large - raise the body size limit.
@@ -165,7 +169,7 @@ app.post('/annotate', async (req, res) => {
       // it stays readable against busy handwriting/highlighting underneath -
       // sized generously based on character count (avoids needing precise
       // font-metric measurement for a simple readability improvement).
-      const labelFontSize = 14;
+      const labelFontSize = MARK_FONT_SIZE;
       const estimatedWidth = pointsLabel.length * labelFontSize * 0.52;
       const estimatedHeight = labelFontSize * 1.15;
       page.drawRectangle({
@@ -287,18 +291,22 @@ app.post('/annotate', async (req, res) => {
       return Math.max(1, Math.min(6, rounded));
     }
 
-    // Place the total score and computed grade at the ACTUAL 'Punkte'/'Note'
-    // field locations from the schema, if they exist with their own
-    // coordinates - falling back to a corner of the last page otherwise.
+    // Place the total score and computed grade relative to the reliable
+    // 'maxScore'/'maxPoints' ("/15") and 'expectedGrade' ("5.5") anchors,
+    // rather than the 'totalScore'/'Punkte'/'finalGrade'/'Note' fields
+    // themselves - those are blank-to-be-filled fields whose coordinates
+    // have proven unreliable on this template (same category of issue as
+    // the antwort-field imprecision seen elsewhere), while maxScore/
+    // expectedGrade already hold real pre-filled values and therefore real,
+    // trustworthy coordinates.
     if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
       const swissGrade = computeSwissGrade(totalPointsAwarded, totalPointsPossible);
-      const scoreText = `${totalPointsAwarded}P / ${totalPointsPossible}P`;
+      // Just the awarded number - "/15" is already pre-printed on the form,
+      // so repeating "/ 15P" here would be redundant.
+      const scoreText = `${totalPointsAwarded}P`;
       const gradeText = swissGrade !== null ? `${swissGrade}` : '';
 
-      const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
-      const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
-
-      function drawAtField(field, text, yNudge, xNudge) {
+      function drawAtField(field, text, yNudge, xNudge, fontSize) {
         if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) return false;
         const page = pages[field.review.page - 1];
         if (!page) return false;
@@ -306,66 +314,42 @@ app.post('/annotate', async (req, res) => {
         const rotationAngle = page.getRotation().angle;
         const [x1, y1] = field.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
-        page.drawText(text, { x: x + (xNudge || 0), y: y + (yNudge || 0), size: 12, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
+        page.drawText(text, { x: x + (xNudge || 0), y: y + (yNudge || 0), size: fontSize || MARK_FONT_SIZE, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
         return true;
       }
 
-      const punkteDrawn = drawAtField(punkteField, scoreText, 0, 0);
-      const noteDrawn = drawAtField(noteField, gradeText, 0, 0);
-
-      // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
-      // OCR'd content yet, so Review may not report coordinates for them.
-      // Try anchoring near known-good fields instead (maxScore/maxPoints DO
-      // have real values already, so they likely have real coordinates).
-      // Nudge LEFT (-70) since these anchor fields' own position typically
-      // sits at the END of a "/ 15" style label - drawing our text directly
-      // there pushes it further right, past the box, rather than starting
-      // cleanly within it. Also nudge down slightly (-8) to compensate for
-      // baseline-vs-top coordinate mismatch (established earlier).
-      //
-      // IMPORTANT: this anchor-based fallback was empirically tuned and
-      // validated ONLY for rotation=270 (the original exam's scanned,
-      // rotated documents). For any other rotation, we've now confirmed
-      // (via direct testing) that even a zero-offset placement at the
-      // anchor's own coordinate can land far from where the field visually
-      // sits - suggesting the coordinate itself may be imprecise for this
-      // field/schema, not just an offset-direction problem. Rather than
-      // keep guessing at fixes for a source coordinate we can't verify,
-      // skip this fallback entirely for untested rotations and go straight
-      // to the reliable last-resort corner placement below.
-      function getFieldRotation(field) {
-        if (!field || !field.review || !field.review.page) return null;
-        const page = pages[field.review.page - 1];
-        return page ? page.getRotation().angle : null;
-      }
-
-      let anchorFallbackUsed = false;
+      // "Punkte: ___ / 15" - anchor on the "/15" value itself, then nudge
+      // LEFT into the gap before it.
+      // FIRST-PASS TUNING (not yet visually confirmed): -55 was picked to
+      // roughly clear a short "13P"-sized label at MARK_FONT_SIZE - expect
+      // to adjust this one number after seeing the result.
       const maxScoreField = reviewData.maxScore || reviewData.maxPoints;
-      const maxScoreRotation = getFieldRotation(maxScoreField);
-      const isTestedRotation = maxScoreRotation === 270;
-
-      if (!punkteDrawn && isTestedRotation) {
-        anchorFallbackUsed = drawAtField(maxScoreField, scoreText, -8, -70);
+      let punkteDrawn = drawAtField(maxScoreField, scoreText, -3, -55, MARK_FONT_SIZE);
+      if (!punkteDrawn) {
+        // Fall back to the field's own reported coordinate, in case a future
+        // document/template actually has a real one.
+        const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
+        punkteDrawn = drawAtField(punkteField, scoreText, 0, 0, MARK_FONT_SIZE);
       }
+
+      // "Note: ___" - anchor on the pre-filled expectedGrade value, then
+      // nudge RIGHT past the "Note:" label instead of drawing on top of it.
+      // FIRST-PASS TUNING: same caveat as above - +55/-20 are a starting
+      // guess, not yet visually confirmed.
+      const expectedGradeField = reviewData.expectedGrade;
+      let noteDrawn = drawAtField(expectedGradeField, gradeText, -20, 55, MARK_FONT_SIZE);
       if (!noteDrawn) {
-        const expectedGradeField = reviewData.expectedGrade;
-        let drawn = drawAtField(expectedGradeField, gradeText + '  ', -8, 0);
-        // No dedicated grade-anchor field exists in this schema at all (or
-        // it's blank with no coordinates) - reuse the SAME maxScore/maxPoints
-        // anchor as a last resort, ONLY for the validated rotation.
-        if (!drawn && isTestedRotation) {
-          drawn = drawAtField(maxScoreField, gradeText, -28, 0);
-        }
-        anchorFallbackUsed = drawn || anchorFallbackUsed;
+        const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
+        noteDrawn = drawAtField(noteField, gradeText, 0, 0, MARK_FONT_SIZE);
       }
 
-      // Fallback tier 3 (last resort): corner of the last page, so the
-      // total is never silently lost even if no anchor fields exist.
-      if (!punkteDrawn && !noteDrawn && !anchorFallbackUsed) {
+      // Last resort: corner of the last page, so the total is never silently
+      // lost even if no anchor fields exist at all.
+      if (!punkteDrawn && !noteDrawn) {
         const lastPage = pages[pages.length - 1];
         const lastPageRotation = lastPage.getRotation().angle;
         const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
-        lastPage.drawText(`Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, {
+        lastPage.drawText(`Total: ${totalPointsAwarded}P / ${totalPointsPossible}P${gradeText ? ' - Grade: ' + gradeText : ''}`, {
           x, y, size: 14, color: rgb(0, 0, 0), rotate: degrees(lastPageRotation)
         });
       }
