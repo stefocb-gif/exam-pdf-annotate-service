@@ -21,7 +21,7 @@ const SHOW_COMMENTS = false;
 // positioning proved unreliable on some documents regardless of rotation,
 // so this is now a simple explicit on/off switch rather than an inferred
 // per-document decision.
-const SHOW_SUBTOTALS = true;
+const SHOW_SUBTOTALS = false;
 
 const app = express();
 
@@ -76,55 +76,85 @@ app.post('/annotate', async (req, res) => {
     // one verdict per gradable part rather than one per whole row.
     const answers = reviewData.answers || [];
 
+    // Where in the page (as a fraction of width, 0=left edge, 1=right edge)
+    // the score column should sit. Tune this single number if marks need to
+    // move left/right - everything else derives from it automatically for
+    // any page rotation, since it's expressed in the same normalized 0-1
+    // space DocuPipe already uses for coordinates.
+    const RIGHT_MARGIN_X_FRACTION = 0.94;
+
+    // Some exercise types (qa_composition, fill_blank_with_case) grade TWO
+    // fields on the same row (e.g. both 'antwort' and 'fall'), producing two
+    // verdicts that share one answerIndex. Since both now anchor to that
+    // row's single 'frage' point, track how many marks have already been
+    // drawn per row so additional ones stack downward instead of landing
+    // exactly on top of the first.
+    const rowMarkCounts = {};
+    const STACK_STEP = 18; // vertical spacing (px) between stacked marks on the same row
+
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
 
-      // WORKAROUND for a known DocuPipe limitation: when multiple rows share
-      // the exact same text value (e.g. several rows all say "Richtig"),
-      // Review can't tell them apart and gives them all the same coordinates.
-      // For true_false_correction's primary judgment column specifically,
-      // the row's OWN 'frage' (the sentence being judged) is always unique
-      // per row - so we anchor the mark there instead of on the collision-
-      // prone 'antwort' field, while still grading antwort's correctness
-      // normally (this only affects WHERE the mark is drawn, not what was
-      // graded). Do NOT apply this to other exercise types - for
-      // preposition_only, frage is the whole paragraph, not a specific
-      // word, and would be a much worse anchor than antwort itself.
-      const exerciseTypeValue = row && (row.exerciseType && row.exerciseType.value !== undefined ? row.exerciseType.value : row.exerciseType);
-      const usePositionOverride = exerciseTypeValue === 'true_false_correction' && verdict.field === 'antwort' && row.subPart !== 'b';
-      const positionField = usePositionOverride ? 'frage' : verdict.field;
+      // ANCHOR CHANGE: every mark is now anchored to the row's own question
+      // TITLE ('frage'), not to the specific graded field ('antwort'/'fall').
+      // Reasons this is more reliable AND matches how a human teacher marks
+      // a paper (one score per question, written in the margin next to that
+      // question, not stamped on top of the handwriting):
+      //   1. 'frage' text is unique per row on this exam, so it doesn't hit
+      //      the duplicate-text coordinate collision Nitai confirmed for
+      //      repeated answer values (e.g. several "Richtig" rows).
+      //   2. On multiple_choice rows specifically, the 'antwort' coordinate
+      //      has been landing ON the question text itself (suspected
+      //      DocuPipe imprecision) - anchoring to 'frage' directly instead
+      //      of fighting that miscoordinate sidesteps the problem entirely.
+      // Falls back to the graded field itself if a row has no 'frage'
+      // (shouldn't happen on this exam's schema, but keeps old rows safe).
+      const anchorField = (row && row.frage) || (row && row[verdict.field]);
 
-      const field = row && row[positionField];
-
-      if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
+      if (!anchorField || !anchorField.review || !anchorField.review.boundingBoxes || anchorField.review.boundingBoxes.length === 0) {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
         continue;
       }
 
-      const pageIndex = field.review.page - 1;
+      const pageIndex = anchorField.review.page - 1;
       const page = pages[pageIndex];
       if (!page) {
-        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (page ${field.review.page} not found - PDF only has ${pages.length} page(s))`);
+        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (page ${anchorField.review.page} not found - PDF only has ${pages.length} page(s))`);
         continue;
       }
 
       const { width, height } = page.getSize();
       const rotationAngle = page.getRotation().angle;
-      const [x1, y1] = field.review.boundingBoxes[0]; // normalized 0-1, top-left origin
+      const [, y1] = anchorField.review.boundingBoxes[0]; // normalized 0-1, top-left origin - only the row's vertical position is used
 
-      const { x: xPosRaw, y: yTopRaw } = toRawCoords(x1, y1, width, height, rotationAngle);
+      // Use the row's own title height (y1) but force the horizontal
+      // position to the right-margin column (RIGHT_MARGIN_X_FRACTION)
+      // instead of the title's own x1. Plugging a fixed normalized x into
+      // the SAME rotation-aware transform used everywhere else in this file
+      // means this works correctly regardless of page rotation, without
+      // needing a separate per-rotation "which raw axis is right" case.
+      let { x: xPos, y: yTop } = toRawCoords(RIGHT_MARGIN_X_FRACTION, y1, width, height, rotationAngle);
 
-      // Nudge the mark slightly toward the visual "above" the answer, so it
-      // doesn't sit directly on top of the handwriting - same directional
-      // convention already established for rotation handling elsewhere in
-      // this file, just a smaller magnitude suited to a subtle nudge rather
-      // than a full separate placement.
-      let xPos = xPosRaw;
-      let yTop = yTopRaw;
-      if (rotationAngle === 270) xPos += 26;
-      else if (rotationAngle === 90) xPos -= 26;
-      else if (rotationAngle === 180) yTop -= 26;
-      else yTop += 26;
+      // Small nudge so the mark's text baseline lines up visually with the
+      // title text on that row, rather than sitting exactly at its top edge.
+      if (rotationAngle === 270) xPos += 4;
+      else if (rotationAngle === 90) xPos -= 4;
+      else if (rotationAngle === 180) yTop -= 4;
+      else yTop += 4;
+
+      // Apply the stacking offset (if this is the 2nd+ mark on this row),
+      // moving in whichever raw direction is visually "down" for this
+      // rotation - same directional convention used for the comment offset
+      // below.
+      const stackIndex = rowMarkCounts[verdict.answerIndex] || 0;
+      rowMarkCounts[verdict.answerIndex] = stackIndex + 1;
+      const stackOffset = stackIndex * STACK_STEP;
+      if (stackOffset > 0) {
+        if (rotationAngle === 270) xPos -= stackOffset;
+        else if (rotationAngle === 90) xPos += stackOffset;
+        else if (rotationAngle === 180) yTop += stackOffset;
+        else yTop -= stackOffset;
+      }
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
