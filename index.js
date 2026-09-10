@@ -120,6 +120,29 @@ app.post('/annotate', async (req, res) => {
     const lastMarkAxisByPage = {};
     const MIN_MARK_GAP = 20; // minimum px between consecutive marks, regardless of which row they belong to
 
+    // The FIRST sub-question under a new exercise number (e.g. "2a", right
+    // after the "2. Extremwetter..." heading) tends to have its 'frage'
+    // anchor land at the EXERCISE HEADING's line rather than its own line -
+    // confirmed visually across multiple runs. Rather than fight DocuPipe's
+    // coordinate for that specific field, apply a small compensating
+    // downward nudge only for that row's mark(s).
+    //
+    // Precomputed per ROW (not per verdict) so that exercise types with two
+    // verdicts on one row (qa_composition, fill_blank_with_case) apply the
+    // same drop consistently to both, rather than only the first verdict
+    // encountered.
+    const FIRST_SUBPART_EXTRA_DROP = 20; // px - first-pass estimate, may need tuning
+    const seenExerciseNumbers = new Set();
+    const firstRowAnswerIndexes = new Set();
+    answers.forEach((row, idx) => {
+      const enRaw = row && row.exerciseNumber;
+      const en = (enRaw && enRaw.value !== undefined) ? enRaw.value : enRaw;
+      if (en !== undefined && en !== null && !seenExerciseNumbers.has(en)) {
+        seenExerciseNumbers.add(en);
+        firstRowAnswerIndexes.add(idx);
+      }
+    });
+
     // Returns a single number that increases as you move visually "down"
     // the page, regardless of rotation - reuses the same per-rotation axis
     // convention already established elsewhere in this file (see the
@@ -180,6 +203,17 @@ app.post('/annotate', async (req, res) => {
       else if (rotationAngle === 90) xPos -= 4;
       else if (rotationAngle === 180) yTop -= 4;
       else yTop += 4;
+
+      // First-sub-question-of-a-new-exercise compensation (see comment
+      // above where FIRST_SUBPART_EXTRA_DROP / firstRowAnswerIndexes are
+      // defined). Keyed off the row itself, so it applies consistently to
+      // every verdict on that row, not just the first one encountered.
+      if (firstRowAnswerIndexes.has(verdict.answerIndex)) {
+        if (rotationAngle === 270) xPos -= FIRST_SUBPART_EXTRA_DROP;
+        else if (rotationAngle === 90) xPos += FIRST_SUBPART_EXTRA_DROP;
+        else if (rotationAngle === 180) yTop += FIRST_SUBPART_EXTRA_DROP;
+        else yTop -= FIRST_SUBPART_EXTRA_DROP;
+      }
 
       // Apply the stacking offset (if this is the 2nd+ mark on this row),
       // moving in whichever raw direction is visually "down" for this
