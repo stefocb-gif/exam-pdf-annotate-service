@@ -323,10 +323,8 @@ app.post('/annotate', async (req, res) => {
 
     if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
       const swissGrade = computeSwissGrade(totalPointsAwarded, totalPointsPossible);
-      // Just the awarded number - "/15" is already pre-printed on the form,
-      // so repeating "/ 15P" here would be redundant.
-      const scoreText = `${totalPointsAwarded}P`;
-      const gradeText = swissGrade !== null ? `${swissGrade}` : '';
+      const scoreText = `${totalPointsAwarded}P/${totalPointsPossible}P`;
+      const gradeText = swissGrade !== null ? `Note: ${swissGrade}` : '';
 
       const headerPage = pages[HEADER_PAGE_INDEX];
       let punkteDrawn = false;
