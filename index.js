@@ -291,6 +291,8 @@ app.post('/annotate', async (req, res) => {
       return Math.max(1, Math.min(6, rounded));
     }
 
+    let headerFieldsDebug = null;
+
     // Place the total score and computed grade relative to the reliable
     // 'maxScore'/'maxPoints' ("/15") and 'expectedGrade' ("5.5") anchors,
     // rather than the 'totalScore'/'Punkte'/'finalGrade'/'Note' fields
@@ -332,16 +334,51 @@ app.post('/annotate', async (req, res) => {
         punkteDrawn = drawAtField(punkteField, scoreText, 0, 0, MARK_FONT_SIZE);
       }
 
-      // "Note: ___" - anchor on the pre-filled expectedGrade value, then
-      // nudge RIGHT past the "Note:" label instead of drawing on top of it.
-      // FIRST-PASS TUNING: same caveat as above - +55/-20 are a starting
-      // guess, not yet visually confirmed.
-      const expectedGradeField = reviewData.expectedGrade;
-      let noteDrawn = drawAtField(expectedGradeField, gradeText, -20, 55, MARK_FONT_SIZE);
+      // "Note: ___" - the direct field (finalGrade/grade/Note/note) is the one
+      // PROVEN to have a usable coordinate on this template (it's what drew
+      // "5.5" successfully before this change) - try it FIRST, now with a
+      // rightward nudge to clear the "Note:" label, and only fall back to
+      // expectedGrade if it's genuinely missing.
+      // FIRST-PASS TUNING: +55 x is a starting guess for clearing the label
+      // width - may still need a small adjustment.
+      const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
+      let noteDrawn = drawAtField(noteField, gradeText, 0, 55, MARK_FONT_SIZE);
       if (!noteDrawn) {
-        const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
-        noteDrawn = drawAtField(noteField, gradeText, 0, 0, MARK_FONT_SIZE);
+        const expectedGradeField = reviewData.expectedGrade;
+        noteDrawn = drawAtField(expectedGradeField, gradeText, -8, 55, MARK_FONT_SIZE);
       }
+
+      // DEBUG: this doesn't affect what's drawn on the PDF - it just reports
+      // the raw coordinates (if any) for every candidate header field, so we
+      // can see exactly what DocuPipe actually returned instead of guessing
+      // at offsets blindly. Check the 'headerFieldsDebug' key in this
+      // service's JSON response after a run - remove this block once the
+      // header positioning is confirmed correct.
+      function describeField(field) {
+        if (!field) return null;
+        if (!field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
+          return { hasCoordinates: false, value: field.value !== undefined ? field.value : field };
+        }
+        return {
+          hasCoordinates: true,
+          value: field.value !== undefined ? field.value : field,
+          page: field.review.page,
+          boundingBox: field.review.boundingBoxes[0]
+        };
+      }
+      headerFieldsDebug = {
+        maxScore: describeField(reviewData.maxScore),
+        maxPoints: describeField(reviewData.maxPoints),
+        totalScore: describeField(reviewData.totalScore),
+        totalPoints: describeField(reviewData.totalPoints),
+        Punkte: describeField(reviewData.Punkte),
+        punkte: describeField(reviewData.punkte),
+        finalGrade: describeField(reviewData.finalGrade),
+        grade: describeField(reviewData.grade),
+        Note: describeField(reviewData.Note),
+        note: describeField(reviewData.note),
+        expectedGrade: describeField(reviewData.expectedGrade)
+      };
 
       // Last resort: corner of the last page, so the total is never silently
       // lost even if no anchor fields exist at all.
@@ -361,7 +398,8 @@ app.post('/annotate', async (req, res) => {
       annotatedPdfBase64: Buffer.from(outBytes).toString('base64'),
       annotatedCount,
       skipped,
-      pdfPageCount: pages.length
+      pdfPageCount: pages.length,
+      headerFieldsDebug
     });
 
   } catch (err) {
