@@ -59,6 +59,8 @@ app.post('/annotate', async (req, res) => {
 
     let annotatedCount = 0;
     const skipped = [];
+    const positionWarnings = [];
+    const lastMarkPosByPage = {};
 
     // Verdicts now target a SPECIFIC field (frage/antwort/fall) per row,
     // one verdict per gradable part rather than one per whole row.
@@ -68,18 +70,26 @@ app.post('/annotate', async (req, res) => {
       const row = answers[verdict.answerIndex];
 
       // WORKAROUND for a known DocuPipe limitation: when multiple rows share
-      // the exact same text value (e.g. several rows all say "Richtig"),
-      // Review can't tell them apart and gives them all the same coordinates.
-      // For true_false_correction's primary judgment column specifically,
-      // the row's OWN 'frage' (the sentence being judged) is always unique
-      // per row - so we anchor the mark there instead of on the collision-
-      // prone 'antwort' field, while still grading antwort's correctness
-      // normally (this only affects WHERE the mark is drawn, not what was
-      // graded). Do NOT apply this to other exercise types - for
-      // preposition_only, frage is the whole paragraph, not a specific
-      // word, and would be a much worse anchor than antwort itself.
+      // the exact same text value (e.g. several rows all say "Richtig", or
+      // "Akkusativ", or "durch"), Review can't tell them apart and gives
+      // them all the same coordinates - one mark ends up drawn directly on
+      // top of the other, hiding it.
+      //
+      // Confirmed via raw node 17 output (Sep 2026): for BOTH
+      // case_identification (fall duplicates like "Akkusativ" x6 in one
+      // exercise) and preposition_only (antwort duplicates like "durch" x2),
+      // each row's OWN 'frage' is still a distinct, genuinely correct
+      // per-row anchor (e.g. "Der Fan" / "in den Fernseher" / "Das Stadion"
+      // for case_identification; "...die Stadt." / "und ...Parks..." for
+      // preposition_only) - so anchoring there doesn't just cosmetically
+      // separate colliding marks, it puts each one on its actual correct
+      // position. This is the SAME principle already applied to
+      // true_false_correction below, now extended to these two types.
       const exerciseTypeValue = row && (row.exerciseType && row.exerciseType.value !== undefined ? row.exerciseType.value : row.exerciseType);
-      const usePositionOverride = exerciseTypeValue === 'true_false_correction' && verdict.field === 'antwort' && row.subPart !== 'b';
+      const usePositionOverride =
+        (exerciseTypeValue === 'true_false_correction' && verdict.field === 'antwort' && row.subPart !== 'b') ||
+        (exerciseTypeValue === 'case_identification' && verdict.field === 'fall') ||
+        (exerciseTypeValue === 'preposition_only' && verdict.field === 'antwort');
       const positionField = usePositionOverride ? 'frage' : verdict.field;
 
       const field = row && row[positionField];
@@ -111,12 +121,32 @@ app.post('/annotate', async (req, res) => {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (page ${field.review.page} not found - PDF only has ${pages.length} page(s))`);
         continue;
       }
-
       const { width, height } = page.getSize();
       const rotationAngle = page.getRotation().angle;
       const [x1, y1] = field.review.boundingBoxes[0]; // normalized 0-1, top-left origin
 
-      const { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
+      let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
+
+      // LAST-RESORT safety net: if this mark would land essentially on top
+      // of the previously-drawn mark on this same page (within a few px in
+      // both directions), nudge it aside so it's at least visible. Unlike
+      // the frage-anchor fix above, this does NOT put the mark on its
+      // genuinely correct position - it only prevents one mark from
+      // silently hiding behind another when even the anchor field
+      // coincides. This should rarely trigger now that frage is used for
+      // the exercise types where duplicate values were the actual cause;
+      // treat any occurrence of this as a signal worth investigating rather
+      // than a real fix.
+      const COLLISION_THRESHOLD = 4; // px
+      const lastPos = lastMarkPosByPage[pageIndex];
+      if (lastPos && Math.abs(xPos - lastPos.x) < COLLISION_THRESHOLD && Math.abs(yTop - lastPos.y) < COLLISION_THRESHOLD) {
+        if (rotationAngle === 270) xPos -= 14;
+        else if (rotationAngle === 90) xPos += 14;
+        else if (rotationAngle === 180) yTop += 14;
+        else yTop -= 14;
+        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - nudged: landed on top of the previous mark even after frage-anchoring; position is a visibility fix only, not confirmed correct`);
+      }
+      lastMarkPosByPage[pageIndex] = { x: xPos, y: yTop };
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
@@ -306,6 +336,7 @@ app.post('/annotate', async (req, res) => {
       annotatedPdfBase64: Buffer.from(outBytes).toString('base64'),
       annotatedCount,
       skipped,
+      positionWarnings,
       pdfPageCount: pages.length
     });
 
