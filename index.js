@@ -69,32 +69,40 @@ app.post('/annotate', async (req, res) => {
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
 
-      // WORKAROUND for a known DocuPipe limitation: when multiple rows share
-      // the exact same text value (e.g. several rows all say "Richtig", or
-      // "Akkusativ", or "durch"), Review can't tell them apart and gives
-      // them all the same coordinates - one mark ends up drawn directly on
-      // top of the other, hiding it.
-      //
-      // Confirmed via raw node 17 output (Sep 2026): for BOTH
-      // case_identification (fall duplicates like "Akkusativ" x6 in one
-      // exercise) and preposition_only (antwort duplicates like "durch" x2),
-      // each row's OWN 'frage' is still a distinct, genuinely correct
-      // per-row anchor (e.g. "Der Fan" / "in den Fernseher" / "Das Stadion"
-      // for case_identification; "...die Stadt." / "und ...Parks..." for
-      // preposition_only) - so anchoring there doesn't just cosmetically
-      // separate colliding marks, it puts each one on its actual correct
-      // position. This is the SAME principle already applied to
-      // true_false_correction below, now extended to these two types.
+      // ANCHOR POLICY for exercise types where the graded field's text can
+      // legitimately repeat across rows (true_false_correction's antwort
+      // often just says "Richtig"/"Falsch"; case_identification's fall
+      // repeats case names like "Akkusativ"; preposition_only's antwort
+      // repeats words like "durch"). Confirmed via real node 17 output
+      // (Sep 2026):
+      //   - Y (row position) is safest taken from 'frage' - each row's own
+      //     sentence/phrase is distinct, so its Y is always correctly
+      //     unique, immune to the duplicate-text collision that corrupts Y
+      //     whenever two rows share identical graded text.
+      //   - X (horizontal position), however, is usually MORE precise from
+      //     the graded field itself than from frage - e.g. true_false_
+      //     correction's antwort X lands right on the Richtig/Falsch
+      //     checkbox, or right on the handwritten correction word, while
+      //     frage's X is just the constant start of the sentence column.
+      // So rather than fully replace one field with the other, take Y from
+      // frage and X from the graded field, falling back to frage's own X
+      // if the graded field has no coordinates at all.
       const exerciseTypeValue = row && (row.exerciseType && row.exerciseType.value !== undefined ? row.exerciseType.value : row.exerciseType);
-      const usePositionOverride =
+      const useHybridAnchor =
         (exerciseTypeValue === 'true_false_correction' && verdict.field === 'antwort' && row.subPart !== 'b') ||
         (exerciseTypeValue === 'case_identification' && verdict.field === 'fall') ||
         (exerciseTypeValue === 'preposition_only' && verdict.field === 'antwort');
-      const positionField = usePositionOverride ? 'frage' : verdict.field;
 
-      const field = row && row[positionField];
+      const gradedField = row && row[verdict.field];
+      const frageField = row && row.frage;
+      const hasBoxes = (f) => f && f.review && f.review.boundingBoxes && f.review.boundingBoxes.length > 0;
 
-      if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) {
+      // The field we check confidence against and treat as "the" field for
+      // page/rotation lookup - always the graded field itself, since that's
+      // what's semantically being evaluated.
+      const field = gradedField;
+
+      if (!hasBoxes(field)) {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
         continue;
       }
@@ -123,7 +131,23 @@ app.post('/annotate', async (req, res) => {
       }
       const { width, height } = page.getSize();
       const rotationAngle = page.getRotation().angle;
-      const [x1, y1] = field.review.boundingBoxes[0]; // normalized 0-1, top-left origin
+
+      // Combine coordinates at the NORMALIZED level (before the rotation
+      // transform), not after - for 90/270-rotated pages, "row position"
+      // does not map cleanly onto a single raw x or y axis, so mixing
+      // already-converted raw coordinates would be wrong. Normalized
+      // coordinates describe the page the way a human sees it regardless
+      // of rotation (per toRawCoords' own contract above), so row
+      // identity is always normalized y1, and column position is always
+      // normalized x1 - safe to combine here, then convert once.
+      const [gx1, gy1] = field.review.boundingBoxes[0]; // graded field's own normalized coords
+      let x1 = gx1;
+      let y1 = gy1;
+
+      if (useHybridAnchor && hasBoxes(frageField) && frageField.review.page === field.review.page) {
+        const [, fy1] = frageField.review.boundingBoxes[0];
+        y1 = fy1; // row position from frage (always unique); column (x1) stays from the graded field
+      }
 
       let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
