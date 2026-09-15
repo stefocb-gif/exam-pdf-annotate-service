@@ -89,6 +89,22 @@ app.post('/annotate', async (req, res) => {
         continue;
       }
 
+      // NEW: DocuPipe now reports a 'confidence' level ("high"/"medium"/
+      // "low") alongside every field's coordinates, describing how sure it
+      // is that the box actually sits on the cited word (per Nitai's Sep
+      // 2026 update). Per his own recommendation: never draw on a "low"
+      // coordinate at all (a wrong-but-confident-looking mark is worse than
+      // no mark), draw "medium" but flag it visually so the teacher knows
+      // to double check it, and treat missing/undefined confidence (older
+      // documents processed before this field existed) the same as "high"
+      // so nothing already working breaks.
+      const confidence = field.review.confidence;
+      if (confidence === 'low') {
+        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (low confidence coordinate - not trustworthy, skipped per Nitai's recommendation)`);
+        continue;
+      }
+      const isMediumConfidence = confidence === 'medium';
+
       const pageIndex = field.review.page - 1;
       const page = pages[pageIndex];
       if (!page) {
@@ -106,6 +122,26 @@ app.post('/annotate', async (req, res) => {
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
         ? `${verdict.pointsAwarded ?? 0}/${verdict.pointsPossible}P`
         : (verdict.isCorrect ? 'OK' : 'X');
+
+      // Medium confidence: the box was placed on the cited text, but that
+      // text didn't read back the same as the extracted value (per Nitai -
+      // often an OCR/handwriting mismatch, or the model itself was unsure).
+      // The location is usually right, just not confirmed - draw a dashed
+      // orange outline around the mark so a teacher knows to double-check
+      // this specific one, without hiding it entirely like "low" does.
+      if (isMediumConfidence) {
+        const labelWidthEstimate = pointsLabel.length * 12 * 0.6 + 6;
+        page.drawRectangle({
+          x: xPos - 3,
+          y: yTop - 3,
+          width: labelWidthEstimate,
+          height: 12 + 4,
+          borderColor: rgb(0.95, 0.6, 0),
+          borderWidth: 1.2,
+          borderDashArray: [3, 2],
+          rotate: degrees(rotationAngle)
+        });
+      }
 
       // Text must be drawn rotated by the SAME angle as the page rotation,
       // so it appears upright (not sideways/upside-down) once the page's
