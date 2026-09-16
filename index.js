@@ -24,7 +24,7 @@ const app = express();
 
 // Point size of every score mark. Shared so the vertical anchoring maths
 // and the actual drawText call can never drift apart.
-const MARK_FONT_SIZE = 12;
+const MARK_FONT_SIZE = 10;
 
 // Per-exercise subtotals are drawn larger and bold so they read as a
 // summary line rather than as just another per-answer mark.
