@@ -214,12 +214,6 @@ app.post('/annotate', async (req, res) => {
         const rad = (angle * Math.PI) / 180;
         return { x: x + distance * Math.cos(rad), y: y + distance * Math.sin(rad) };
       }
-      // Keep the original (pre-shift) anchor too - the comment line below
-      // is a DIFFERENT length of text than pointsLabel, so it needs its own
-      // independent right-alignment from the same anchor point, not a
-      // reuse of pointsLabel's already-shifted position.
-      const marginAnchorX = xPos;
-      const marginAnchorY = yTop;
       if (isFrageMargin) {
         const labelWidth = marginFont.widthOfTextAtSize(pointsLabel, 12);
         const shifted = shiftAlongTextDirection(xPos, yTop, -labelWidth, rotationAngle);
@@ -258,7 +252,15 @@ app.post('/annotate', async (req, res) => {
         rotate: degrees(rotationAngle)
       });
 
-      if (verdict.comment) {
+      // Margin marks skip the comment entirely - measured pixel evidence
+      // showed this table spans almost the full page width, leaving only
+      // ~20pt of genuine clearance past its right border. That's enough
+      // for the short point-value line, but nowhere near enough for a full
+      // comment, which would have to reach back into the Fall column's own
+      // marks regardless of right-alignment. The antwort/fall marks on the
+      // same row keep their own full comments, so the row isn't left
+      // without feedback - only the frage-specific explanation is dropped.
+      if (verdict.comment && !isFrageMargin) {
         // Offset the comment slightly "below" the mark, in the rotated
         // frame's own sense of down - handled by nudging along whichever
         // raw axis corresponds to visual-down for this rotation.
@@ -268,24 +270,6 @@ app.post('/annotate', async (req, res) => {
         else if (rotationAngle === 90) commentX += 12;
         else if (rotationAngle === 180) commentY += 12;
         else commentY -= 12;
-
-        // Margin comments are usually the LONGER line and the one most at
-        // risk of running off the page - right-align independently from
-        // the same original anchor, using the comment's own measured
-        // width (not pointsLabel's, and not a reuse of pointsLabel's
-        // already-shifted x).
-        if (isFrageMargin) {
-          const commentWidth = marginFont.widthOfTextAtSize(verdict.comment, 7);
-          let belowAnchorX = marginAnchorX;
-          let belowAnchorY = marginAnchorY;
-          if (rotationAngle === 270) belowAnchorX -= 12;
-          else if (rotationAngle === 90) belowAnchorX += 12;
-          else if (rotationAngle === 180) belowAnchorY += 12;
-          else belowAnchorY -= 12;
-          const shiftedComment = shiftAlongTextDirection(belowAnchorX, belowAnchorY, -commentWidth, rotationAngle);
-          commentX = shiftedComment.x;
-          commentY = shiftedComment.y;
-        }
 
         page.drawText(verdict.comment, {
           x: commentX,
