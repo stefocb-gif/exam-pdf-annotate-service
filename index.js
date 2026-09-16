@@ -92,6 +92,28 @@ function hasTrustedBoxes(f) {
 const COLUMN_TIGHTNESS = 0.02;
 const MIN_COLUMN_OUTLIER = 0.05;
 
+// Median x of every OTHER field in one exercise - i.e. where the other
+// columns of this exercise actually sit. Used to tell a genuinely broken box
+// (one that has drifted into a different field's column) from a box that is
+// merely far from its own column, which happens legitimately when a
+// two-column exercise gets merged into one row per line.
+function otherFieldMedians(answers, exerciseKey, fieldName) {
+  const out = [];
+  for (const other of ['frage', 'antwort', 'fall']) {
+    if (other === fieldName) continue;
+    const xs = [];
+    answers.forEach(row => {
+      if (String(fieldValue(row.exerciseNumber)) !== String(exerciseKey)) return;
+      const f = row[other];
+      if (hasBoxes(f)) xs.push(f.review.boundingBoxes[0][0]);
+    });
+    if (xs.length < 2) continue;
+    const s = xs.sort((a, b) => a - b);
+    out.push(s[Math.floor(s.length / 2)]);
+  }
+  return out;
+}
+
 // GENERAL REPAIR for DocuPipe's duplicate-text collision.
 //
 // When two rows in one exercise hold the same text ("Akkusativ" twice,
@@ -128,7 +150,7 @@ function buildColumnRepairMap(answers, fieldName) {
     lines.get(lineKey).push(idx);
   });
 
-  for (const [, lines] of byExercise) {
+  for (const [exerciseKey, lines] of byExercise) {
     // Learn column positions, using only lines whose boxes are all present
     // and all distinct - a collided line would teach the wrong position.
     const columnX = new Map(); // ordinal -> [x1, ...]
@@ -187,9 +209,24 @@ function buildColumnRepairMap(answers, fieldName) {
         if (repaired.has(key)) continue; // already handled as a duplicate
         const g = answers[i] && answers[i][fieldName];
         if (!hasBoxes(g)) continue;
-        if (Math.abs(g.review.boundingBoxes[0][0] - median) > threshold) {
-          repaired.set(key, median);
-        }
+        const x = g.review.boundingBoxes[0][0];
+        if (Math.abs(x - median) <= threshold) continue;
+
+        // Being far from its own column is NOT enough to call a box wrong.
+        // Where an exercise has two answer columns but the extraction merged
+        // each line into a single row, the surviving answers are a
+        // legitimate mix of both columns - and "repairing" the ones that
+        // came from the second column would move correct marks to the wrong
+        // place. What actually marks a box as broken is that it has landed
+        // inside ANOTHER field's column: the Aufgabe 1 answer returned at
+        // x=0.0979, sitting in the Frage column at ~0.085. So require the
+        // outlier to coincide with a different field's column before
+        // touching it.
+        const drifted = otherFieldMedians(answers, exerciseKey, fieldName)
+          .some(m => Math.abs(x - m) < MIN_COLUMN_OUTLIER);
+        if (!drifted) continue;
+
+        repaired.set(key, median);
       }
     }
   }
@@ -618,16 +655,51 @@ app.post('/annotate', async (req, res) => {
 
         const { width, height } = page.getSize();
         const rotationAngle = page.getRotation().angle;
-        const [x1, y1] = anchorField.review.boundingBoxes[0];
-        const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
+        const anchorBox = anchorField.review.boundingBoxes[0];
+        const lineHeightNorm = SUBTOTAL_FONT_SIZE / ((rotationAngle === 90 || rotationAngle === 270) ? width : height);
 
-        const subtotalText = `${fmtPoints(sub.awarded)}P / ${fmtPoints(sub.possible)}P`;
-        let subX = x;
-        let subY = y;
-        if (rotationAngle === 270) subX += 40;
-        else if (rotationAngle === 90) subX -= 40;
-        else if (rotationAngle === 180) subY -= 20;
-        else subY += 20;
+        // Same compact form as the individual marks ("3.13/5P" rather than
+        // "3.13P / 5P"): it reads consistently, and the shorter string is
+        // what lets the label fit in the page's left margin below.
+        const subtotalText = `${fmtPoints(sub.awarded)}/${fmtPoints(sub.possible)}P`;
+
+        // Where the exercise's own text block begins - the leftmost edge of
+        // any usable box in this exercise. Everything left of that is blank
+        // margin, measured from this scan rather than assumed, so it follows
+        // whatever crop or skew the page happens to have.
+        let textStartNorm = anchorBox[0];
+        answers.forEach(a => {
+          if (String(fieldValue(a.exerciseNumber)) !== String(exNum)) return;
+          [a.frage, a.antwort, a.fall].forEach(f => {
+            if (hasTrustedBoxes(f) && f.review.page === anchorField.review.page) {
+              textStartNorm = Math.min(textStartNorm, f.review.boundingBoxes[0][0]);
+            }
+          });
+        });
+
+        // Draw at the anchor row's OWN height, not above it. The previous
+        // 20pt upward offset is what pushed a subtotal out of its own
+        // exercise: Aufgabe 3's anchor is its instruction line, so lifting
+        // the label clear of that line landed it inside Aufgabe 2. Sitting
+        // level with the anchor keeps every subtotal inside the exercise it
+        // belongs to.
+        const anchorY = rowAnchorY(anchorBox, lineHeightNorm);
+        const labelW = labelFontBold.widthOfTextAtSize(subtotalText, SUBTOTAL_FONT_SIZE);
+        const marginPt = textStartNorm * ((rotationAngle === 90 || rotationAngle === 270) ? height : width);
+
+        let subX, subY;
+        if (marginPt - labelW - 4 >= 2) {
+          // Fits in the margin: right-align it to end just before the text.
+          const pos = toRawCoords(textStartNorm, anchorY, width, height, rotationAngle);
+          const rad = (rotationAngle * Math.PI) / 180;
+          subX = pos.x - (labelW + 4) * Math.cos(rad);
+          subY = pos.y - (labelW + 4) * Math.sin(rad);
+        } else {
+          // Margin too narrow on this page - keep the old placement rather
+          // than push the label off the edge.
+          const pos = toRawCoords(anchorBox[0], anchorBox[1], width, height, rotationAngle);
+          ({ x: subX, y: subY } = nudgeVisualDown(pos.x, pos.y, -20, rotationAngle));
+        }
 
         // Two sub-parts can now share one anchor row (see the fallback
         // above), which would stack "2.5P / 3P" and "3P / 3P" on the exact
