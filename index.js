@@ -130,6 +130,49 @@ function buildColumnRepairMap(answers, fieldName) {
   return repaired;
 }
 
+// Learns where the Richtig / Falsch checkbox columns actually sit.
+//
+// In true_false_correction the schema merges both answers into one string:
+// "Richtig" when the sentence is fine, "Falsch, vom" when the student also
+// wrote a correction. DocuPipe boxes whatever it read - so a bare "Richtig"
+// lands on the checkbox, while "Falsch, vom" lands on the correction word
+// out in the sentence. That is why judgment marks currently scatter between
+// the table and the text.
+//
+// Rows whose answer is a BARE judgment word are the ones boxed on a
+// checkbox, so they tell us where that column is. Keyed per exercise and per
+// word, so "richtig" and "falsch" are learned independently. Nothing is
+// assumed about table geometry - if a column was never observed, the caller
+// degrades honestly rather than inventing a position.
+function buildJudgmentColumnMap(answers) {
+  const raw = new Map(); // exercise -> word -> [x1, ...]
+  answers.forEach(row => {
+    const a = row && row.antwort;
+    if (!hasTrustedBoxes(a)) return;
+    const v = fieldValue(a);
+    if (typeof v !== 'string') return;
+    const m = v.trim().match(/^(richtig|falsch)$/i);
+    if (!m) return; // has a correction appended - boxed on the text, not the checkbox
+    const ex = String(fieldValue(row.exerciseNumber));
+    if (!raw.has(ex)) raw.set(ex, new Map());
+    const words = raw.get(ex);
+    const w = m[1].toLowerCase();
+    if (!words.has(w)) words.set(w, []);
+    words.get(w).push(a.review.boundingBoxes[0][0]);
+  });
+
+  const out = new Map();
+  for (const [ex, words] of raw) {
+    const medians = new Map();
+    for (const [w, xs] of words) {
+      const s = [...xs].sort((a, b) => a - b);
+      medians.set(w, s[Math.floor(s.length / 2)]);
+    }
+    out.set(ex, medians);
+  }
+  return out;
+}
+
 // Which part of a bounding box the mark's baseline should sit on.
 //
 // boundingBoxes are [x1, y1, x2, y2] with a top-left origin, so y1 is the
@@ -195,6 +238,7 @@ app.post('/annotate', async (req, res) => {
       ...buildColumnRepairMap(answers, 'antwort'),
       ...buildColumnRepairMap(answers, 'fall')
     ]);
+    const judgmentColumns = buildJudgmentColumnMap(answers);
 
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
@@ -282,11 +326,39 @@ app.post('/annotate', async (req, res) => {
         positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - column repaired: DocuPipe returned a duplicate box for this value, X taken from the same column on uncollided lines`);
       }
 
+      // 'markAs' (set by node 19z for true_false_correction) says which half
+      // of a merged "Falsch, vom" answer this verdict is about:
+      //   judgment  -> belongs in the Richtig/Falsch table column
+      //   correction-> belongs on the correction word out in the sentence
+      // A correction mark therefore wants the antwort box exactly as-is,
+      // including its own Y, because the correction is written on its own
+      // line under the sentence rather than on the frage line.
+      const isCorrectionMark = verdict.markAs === 'correction';
+
+      if (verdict.markAs === 'judgment') {
+        const cols = judgmentColumns.get(String(fieldValue(row && row.exerciseNumber)));
+        if (cols && cols.size) {
+          const answerText = String(fieldValue(field) || '');
+          const word = /^\s*falsch/i.test(answerText) ? 'falsch' : 'richtig';
+          if (cols.has(word)) {
+            x1 = cols.get(word);
+          } else {
+            // That column was never observed on this paper (e.g. every
+            // "Falsch" row also carried a correction, so nothing was ever
+            // boxed on the Falsch checkbox). Use the column we DID observe,
+            // so the mark is at least inside the table, and say so.
+            x1 = cols.values().next().value;
+            positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the "${word}" column never appears boxed on this paper; judgment mark placed in the observed judgment column instead`);
+          }
+        }
+      }
+
       // Only borrow frage's row position if frage itself is trustworthy -
       // the same confidence rule applied to the graded field above. A
       // low-confidence frage box is exactly as likely to be in the wrong
       // place as the duplicate-text coordinate it's meant to replace.
       if (useHybridAnchor &&
+          !isCorrectionMark &&
           hasTrustedBoxes(frageField) &&
           frageField.review.page === field.review.page) {
         y1 = rowAnchorY(frageField.review.boundingBoxes[0]); // row position from frage (unique per row); column (x1) stays from the graded field
