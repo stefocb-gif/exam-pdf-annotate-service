@@ -67,6 +67,14 @@ function hasTrustedBoxes(f) {
   return hasBoxes(f) && f.review.confidence !== 'low';
 }
 
+// How tightly a field's x-positions must cluster before we treat them as a
+// real table column (median absolute deviation, in normalized page width),
+// and how far from that column a box must sit before we call it misplaced.
+// Measured on real scans: genuine columns vary by under 0.02, while the
+// scattered blanks of a running-text exercise vary by 0.15 and upwards.
+const COLUMN_TIGHTNESS = 0.02;
+const MIN_COLUMN_OUTLIER = 0.05;
+
 // GENERAL REPAIR for DocuPipe's duplicate-text collision.
 //
 // When two rows in one exercise hold the same text ("Akkusativ" twice,
@@ -129,6 +137,43 @@ function buildColumnRepairMap(answers, fieldName) {
         const sorted = [...samples].sort((a, b) => a - b);
         repaired.set(`${i}:${fieldName}`, sorted[Math.floor(sorted.length / 2)]); // median
       });
+    }
+
+    // SECOND PASS - a box that is simply in the wrong column.
+    //
+    // Distinct from the duplicate case: nothing is repeated, DocuPipe just
+    // returned a position that belongs to another column entirely (seen on
+    // Aufgabe 1, where one long answer was boxed at x=0.0979 in the Frage
+    // column while every other answer sat at ~0.47). Confidence was "high",
+    // so nothing else catches it.
+    //
+    // A table column is a tight cluster, so an outlier is obvious - but only
+    // if the field really forms a column. In running text (Aufgabe 4) the
+    // blanks are scattered across the line and every value is legitimately
+    // far from the median, so "repairing" there would wreck correct
+    // positions. The median absolute deviation tells the two apart without
+    // needing to know which exercise type we're looking at: a real column
+    // has a tiny MAD, scattered running text has a large one.
+    for (const [ord, xs] of columnX) {
+      if (xs.length < 3) continue; // too few samples to call anything an outlier
+      const sorted = [...xs].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      const devs = xs.map(x => Math.abs(x - median)).sort((a, b) => a - b);
+      const mad = devs[Math.floor(devs.length / 2)];
+      if (mad > COLUMN_TIGHTNESS) continue; // not a column - leave every row alone
+      const threshold = Math.max(MIN_COLUMN_OUTLIER, mad * 8);
+
+      for (const [, idxs] of lines) {
+        const i = idxs[ord];
+        if (i === undefined) continue;
+        const key = `${i}:${fieldName}`;
+        if (repaired.has(key)) continue; // already handled as a duplicate
+        const g = answers[i] && answers[i][fieldName];
+        if (!hasBoxes(g)) continue;
+        if (Math.abs(g.review.boundingBoxes[0][0] - median) > threshold) {
+          repaired.set(key, median);
+        }
+      }
     }
   }
   return repaired;
