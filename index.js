@@ -469,6 +469,7 @@ app.post('/annotate', async (req, res) => {
     // of that sub-part, approximating "next to the exercise/sub-part title"
     // since we don't have a dedicated title-coordinate field - the first
     // matching answer row is the closest reliable anchor we have.
+    const subtotalsDrawnPerRow = {};
     if (Array.isArray(subtotals)) {
       for (const sub of subtotals) {
         // sub.key looks like "1a", "1b", or just "2" (no sub-part letter).
@@ -477,14 +478,24 @@ app.post('/annotate', async (req, res) => {
         const [, exNumStr, subPartLetter] = match;
         const exNum = parseInt(exNumStr, 10);
 
-        const firstRowIndex = answers.findIndex(a => {
-          const rowExNum = fieldValue(a.exerciseNumber);
+        const matchesExercise = (a) => String(fieldValue(a.exerciseNumber)) === String(exNum);
+        let firstRowIndex = answers.findIndex(a => {
+          if (!matchesExercise(a)) return false;
           const rowSubPart = fieldValue(a.subPart);
-          if (String(rowExNum) !== String(exNum)) return false;
           if (subPartLetter === 'a') return rowSubPart === 'a' || !rowSubPart; // null/undefined subPart defaults to 'a' by convention (matches node 21 and the true_false_correction template)
           if (subPartLetter) return rowSubPart === subPartLetter;
           return !rowSubPart; // no letter in key means match rows with no subPart
         });
+
+        // No row carries this sub-part letter at all. That is normal rather
+        // than broken: in true_false_correction the schema emits one row per
+        // sentence with subPart null, and node 19z splits each into an "a"
+        // judgment and a "b" correction - so pool "5b" has real points but
+        // no row of its own to sit beside. Anchor it to the exercise's rows
+        // anyway, otherwise a whole sub-part's score silently never appears.
+        if (firstRowIndex === -1) {
+          firstRowIndex = answers.findIndex(matchesExercise);
+        }
         if (firstRowIndex === -1) continue;
 
         const row = answers[firstRowIndex];
@@ -513,6 +524,16 @@ app.post('/annotate', async (req, res) => {
         else if (rotationAngle === 90) subX -= 40;
         else if (rotationAngle === 180) subY -= 20;
         else subY += 20;
+
+        // Two sub-parts can now share one anchor row (see the fallback
+        // above), which would stack "2.5P / 3P" and "3P / 3P" on the exact
+        // same spot. Offset each additional subtotal on a given row so both
+        // stay readable.
+        const stackIndex = subtotalsDrawnPerRow[firstRowIndex] || 0;
+        subtotalsDrawnPerRow[firstRowIndex] = stackIndex + 1;
+        if (stackIndex > 0) {
+          ({ x: subX, y: subY } = nudgeVisualDown(subX, subY, stackIndex * 14, rotationAngle));
+        }
 
         page.drawText(subtotalText, {
           x: subX, y: subY, size: 11, color: rgb(0, 0, 0.6), rotate: degrees(rotationAngle)
