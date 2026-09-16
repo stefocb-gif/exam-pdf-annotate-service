@@ -30,6 +30,10 @@ const MARK_FONT_SIZE = 10;
 // summary line rather than as just another per-answer mark.
 const SUBTOTAL_FONT_SIZE = 12;
 
+// The header total and final grade are drawn at the same weight and size as
+// the subtotals, so the three summary numbers on the page read as one set.
+const HEADER_FONT_SIZE = 12;
+
 // Exam PDFs with images can be large - raise the body size limit.
 app.use(express.json({ limit: '25mb' }));
 
@@ -422,6 +426,28 @@ app.post('/annotate', async (req, res) => {
       let x1 = gradedBox[0];                          // column position: the graded field's own left edge
       let y1 = rowAnchorY(gradedBox, lineHeightNorm);  // row position: first line of the field
 
+      // COLLAPSED BOX: the answer's box starts at exactly the same x as its
+      // own sentence and ends before the sentence does - i.e. it spans
+      // "sentence start .. end of the answer" rather than just the answer.
+      // Seen on Aufgabe 6 rows 1 and 4, where the mark landed on "Ich"
+      // instead of on the pronoun, at confidence "high".
+      //
+      // The right edge is still the end of the real answer, so anchoring
+      // there and right-aligning the label puts the mark on the answer
+      // instead of on the first word of the sentence. Requiring the box to
+      // end BEFORE the sentence matters: where frage and antwort share one
+      // identical box (Aufgabe 4 row 3) nothing can be inferred, and that
+      // case is excluded rather than guessed at.
+      let rightAlignMark = false;
+      const frageBox = hasTrustedBoxes(frageField) ? frageField.review.boundingBoxes[0] : null;
+      if (frageBox && frageBox.length >= 4 && gradedBox.length >= 4 &&
+          Math.abs(gradedBox[0] - frageBox[0]) < 0.005 &&
+          gradedBox[2] < frageBox[2] - 0.005) {
+        x1 = gradedBox[2];
+        rightAlignMark = true;
+        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - box collapsed onto the sentence start; mark anchored to the answer's right edge instead`);
+      }
+
       // If this row's box was a duplicate of another row's, its column is
       // wrong - substitute the column learned from the uncollided rows of
       // the same exercise (see buildColumnRepairMap).
@@ -508,6 +534,17 @@ app.post('/annotate', async (req, res) => {
       // neighbouring column in multi-column exercises. The score and its
       // colour carry the verdict; the wording lives in the workflow output
       // if it's ever needed.
+      // For a collapsed box the anchor is the answer's RIGHT edge, so the
+      // label has to be shifted back by its own width to end there rather
+      // than start there. The shift follows the text direction, so it stays
+      // correct on a rotated page.
+      if (rightAlignMark) {
+        const w = labelFont.widthOfTextAtSize(pointsLabel, MARK_FONT_SIZE);
+        const rad = (rotationAngle * Math.PI) / 180;
+        xPos -= w * Math.cos(rad);
+        yTop -= w * Math.sin(rad);
+      }
+
       const labelWidth = drawLabel(page, pointsLabel, xPos, yTop, MARK_FONT_SIZE, color, rotationAngle);
 
       // Medium confidence: the box was placed on the cited text, but that
@@ -641,7 +678,7 @@ app.post('/annotate', async (req, res) => {
         const rotationAngle = page.getRotation().angle;
         const [x1, y1] = field.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
-        drawLabel(page, text, x, y + (yNudge || 0), 12, rgb(0, 0, 0.7), rotationAngle);
+        drawLabel(page, text, x, y + (yNudge || 0), HEADER_FONT_SIZE, rgb(0, 0, 0.7), rotationAngle, labelFontBold);
         return true;
       }
 
@@ -672,9 +709,7 @@ app.post('/annotate', async (req, res) => {
         const lastPage = pages[pages.length - 1];
         const lastPageRotation = lastPage.getRotation().angle;
         const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
-        lastPage.drawText(`Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, {
-          x, y, size: 14, color: rgb(0, 0, 0), rotate: degrees(lastPageRotation)
-        });
+        drawLabel(lastPage, `Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, x, y, HEADER_FONT_SIZE, rgb(0, 0, 0), lastPageRotation, labelFontBold);
       }
     }
 
