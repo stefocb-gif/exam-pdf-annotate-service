@@ -151,6 +151,20 @@ app.post('/annotate', async (req, res) => {
 
       let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
+      // SIMPLE FIX: a verdict for the 'frage' field itself (e.g.
+      // qa_composition, where the student handwrites their own question)
+      // anchors exactly where that handwritten text sits - drawing right on
+      // top of it. Nudge it up and off the text, into the small gap above
+      // the line, the same way the comment offset below already does for
+      // "below the mark" - just applied here as "above the frage text"
+      // before anything is drawn.
+      if (verdict.field === 'frage') {
+        if (rotationAngle === 270) xPos += 16;
+        else if (rotationAngle === 90) xPos -= 16;
+        else if (rotationAngle === 180) yTop -= 16;
+        else yTop += 16;
+      }
+
       // LAST-RESORT safety net: if this mark would land essentially on top
       // of the previously-drawn mark on this same page (within a few px in
       // both directions), nudge it aside so it's at least visible. Unlike
