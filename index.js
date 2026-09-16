@@ -154,26 +154,45 @@ app.post('/annotate', async (req, res) => {
         y1 = fy1; // row position from frage (always unique); column (x1) stays from the graded field
       }
 
-      // FIX (revised): a verdict for the 'frage' field itself (e.g.
-      // qa_composition, where the student handwrites their own question)
-      // anchors exactly where that handwritten text sits. A first attempt
-      // nudged it up by a fixed amount, but real output showed this table's
-      // rows are packed too tightly for that to find any actual empty
-      // space - it just traded one collision (its own row's text) for
-      // another (the row above's text), landing on top of something
-      // either way.
-      // Fixed properly this time: keep the row's own Y (still correct),
-      // but move X out to the page's outer right margin entirely, well
-      // past the table's own columns - the same "reliable row, dedicated
-      // clear column" approach already proven for the Hörverstehen
-      // service. This sidesteps the dense-table problem outright instead
-      // of hunting for a gap that may not exist.
-      const RIGHT_MARGIN_X_FRACTION = 0.95; // first-pass estimate for this table's outer margin - not yet visually confirmed
+      // FIX (further revised): a FIXED page-fraction margin is fragile
+      // across different scans of the SAME test - scan skew, a different
+      // crop, or slightly different paper alignment can all shift where
+      // the table actually sits as a percentage of that particular scan's
+      // page width, especially with the ~3% clearance this table's layout
+      // leaves to work with. Instead, derive the margin position from THIS
+      // SAME SCAN's own 'fall' field right edge - boundingBoxes are
+      // [x1,y1,x2,y2], and x2 (the right edge) was previously unused here.
+      // This makes the margin move WITH wherever the table actually sits
+      // on any given scan, rather than assuming every scan lines up
+      // identically.
       if (verdict.field === 'frage') {
-        x1 = RIGHT_MARGIN_X_FRACTION;
+        const fallField = row && row.fall;
+        const MARGIN_GAP_POINTS = 15; // desired absolute gap, in PDF points, past the Fall column's own right edge
+        if (hasBoxes(fallField) && fallField.review.page === field.review.page && fallField.review.boundingBoxes[0].length >= 4) {
+          const fallX2 = fallField.review.boundingBoxes[0][2]; // right edge of THIS row's Fall column, normalized
+          x1 = Math.min(fallX2 + (MARGIN_GAP_POINTS / width), 0.99);
+        } else {
+          // Fallback if this row has no usable 'fall' box to anchor from
+          // (shouldn't happen for qa_composition, but keeps this safe for
+          // any other future exercise type that might reuse this path) -
+          // a fixed-fraction guess as a last resort only.
+          x1 = 0.95;
+        }
       }
 
       let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
+
+      // The frage field's own Y sits at the very TOP of its row's text
+      // (where the handwritten question starts), which visually crowds
+      // right up against the row ABOVE's own Fall-column mark. Nudge it
+      // down slightly, moving it away from the boundary and toward the
+      // vertical center of its own row, rather than hugging the top edge.
+      if (verdict.field === 'frage') {
+        if (rotationAngle === 270) xPos -= 10;
+        else if (rotationAngle === 90) xPos += 10;
+        else if (rotationAngle === 180) yTop += 10;
+        else yTop -= 10;
+      }
 
       // LAST-RESORT safety net: if this mark would land essentially on top
       // of the previously-drawn mark on this same page (within a few px in
