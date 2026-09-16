@@ -9,7 +9,7 @@
 // Output: { annotatedPdfBase64 }
 
 const express = require('express');
-const { PDFDocument, rgb, degrees, StandardFonts } = require('pdf-lib');
+const { PDFDocument, rgb, degrees } = require('pdf-lib');
 
 const app = express();
 
@@ -39,6 +39,129 @@ function toRawCoords(x1, y1, rawWidth, rawHeight, rotationAngle) {
   }
 }
 
+// DocuPipe wraps every extracted field as { value, review }. Some places
+// need the plain value (comparing exerciseType/subPart), others need the
+// review block (coordinates). One helper for the value side, used
+// everywhere - comparing a wrapped field directly against a string is
+// always false/true by accident, which is exactly the kind of silent bug
+// this prevents.
+function fieldValue(f) {
+  return f && typeof f === 'object' && 'value' in f ? f.value : f;
+}
+
+// True when a field has usable coordinates to draw against.
+function hasBoxes(f) {
+  return !!(f && f.review && f.review.boundingBoxes && f.review.boundingBoxes.length > 0);
+}
+
+// A field is only worth drawing against if it has coordinates AND DocuPipe
+// is not telling us those coordinates are untrustworthy. "low" means it
+// could not place the value on the cited line at all, so the box falls back
+// to a whole line or lands somewhere unrelated - a confident-looking mark in
+// the wrong place is worse than no mark (Nitai, Sep 2026).
+function hasTrustedBoxes(f) {
+  return hasBoxes(f) && f.review.confidence !== 'low';
+}
+
+// GENERAL REPAIR for DocuPipe's duplicate-text collision.
+//
+// When two rows in one exercise hold the same text ("Akkusativ" twice,
+// "Richtig" twice, "durch" twice), DocuPipe returns the FIRST occurrence's
+// box for both - and still reports confidence "high", so the confidence flag
+// cannot catch it. Confirmed in node 17 output: Aufgabe 2 rows 5/6 and 7/8
+// have byte-identical boxes.
+//
+// Borrowing the row position from 'frage' repairs the Y axis, because each
+// printed line has its own frage. It cannot repair X, so the second answer
+// on a line lands in the first answer's column.
+//
+// X is recoverable because these exercises are grids. Rows that share a
+// frage share a printed line, and their answers sit in fixed columns across
+// every line. So: learn each column's X from the lines that did NOT collide,
+// then give a collided row the X of its own ordinal position. Nothing is
+// guessed - the numbers come from other rows of the same exercise.
+//
+// Lines holding a single answer (Aufgabe 1, 5, 6) form groups of one, can
+// never collide within themselves, and are left completely untouched.
+function buildColumnRepairMap(answers, fieldName) {
+  const repaired = new Map();
+  const boxSig = (f) => hasBoxes(f) ? f.review.boundingBoxes[0].join(',') : null;
+
+  // exercise -> printed line -> row indexes on that line
+  const byExercise = new Map();
+  answers.forEach((row, idx) => {
+    if (!hasBoxes(row && row.frage)) return;
+    const ex = String(fieldValue(row.exerciseNumber));
+    const lineKey = boxSig(row.frage);
+    if (!byExercise.has(ex)) byExercise.set(ex, new Map());
+    const lines = byExercise.get(ex);
+    if (!lines.has(lineKey)) lines.set(lineKey, []);
+    lines.get(lineKey).push(idx);
+  });
+
+  for (const [, lines] of byExercise) {
+    // Learn column positions, using only lines whose boxes are all present
+    // and all distinct - a collided line would teach the wrong position.
+    const columnX = new Map(); // ordinal -> [x1, ...]
+    for (const [, idxs] of lines) {
+      const sigs = idxs.map(i => boxSig(answers[i] && answers[i][fieldName]));
+      if (sigs.some(s => !s)) continue;
+      if (new Set(sigs).size !== sigs.length) continue;
+      idxs.forEach((i, ord) => {
+        const x = answers[i][fieldName].review.boundingBoxes[0][0];
+        if (!columnX.has(ord)) columnX.set(ord, []);
+        columnX.get(ord).push(x);
+      });
+    }
+    if (columnX.size === 0) continue;
+
+    for (const [, idxs] of lines) {
+      const sigs = idxs.map(i => boxSig(answers[i] && answers[i][fieldName]));
+      idxs.forEach((i, ord) => {
+        if (!sigs[ord]) return;
+        if (!sigs.some((s, o) => s === sigs[ord] && o !== ord)) return; // not a duplicate
+        const samples = columnX.get(ord);
+        if (!samples || !samples.length) return;
+        const sorted = [...samples].sort((a, b) => a - b);
+        repaired.set(`${i}:${fieldName}`, sorted[Math.floor(sorted.length / 2)]); // median
+      });
+    }
+  }
+  return repaired;
+}
+
+// Which part of a bounding box the mark's baseline should sit on.
+//
+// boundingBoxes are [x1, y1, x2, y2] with a top-left origin, so y1 is the
+// box TOP and y2 its BOTTOM. drawText places the BASELINE at the y it's
+// given and the glyphs grow upward from there - so anchoring on the box top
+// renders the whole mark ABOVE the field it belongs to. In a roomy layout
+// that reads as a tidy annotation above the line; in a tight table row
+// (Aufgabe 5's rows are ~13pt tall, about one line of 12pt text) it puts
+// the mark completely outside its own row, which is why row 1's mark landed
+// on the table header and row 6's on the row-5 divider.
+// Anchoring on the box BOTTOM instead makes the glyphs fill the box upward,
+// so the mark sits INSIDE the field it grades. Falls back to the top for
+// any box that doesn't report all four values.
+function rowAnchorY(box) {
+  return box && box.length >= 4 ? box[3] : box[1];
+}
+
+// Moves a raw PDF point "visually down" the page by `distance`, for any page
+// rotation. Raw PDF y grows upward, but WHICH raw axis counts as visually
+// down depends on the page's /Rotate flag - the same mapping toRawCoords
+// encodes. Centralised because getting it wrong fails silently: the mark
+// still draws, just drifting in the wrong direction. Pass a negative
+// distance to move visually up.
+function nudgeVisualDown(x, y, distance, rotationAngle) {
+  switch (rotationAngle) {
+    case 270: return { x: x - distance, y };
+    case 90:  return { x: x + distance, y };
+    case 180: return { x, y: y + distance };
+    default:  return { x, y: y - distance };
+  }
+}
+
 app.get('/', (req, res) => {
   res.send('PDF annotation service is running. POST to /annotate.');
 });
@@ -56,11 +179,6 @@ app.post('/annotate', async (req, res) => {
     const pdfBytes = Buffer.from(pdfBase64, 'base64');
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const pages = pdfDoc.getPages();
-    // Embedded once so the right-margin frage marks can be right-aligned
-    // (measuring real text width), guaranteeing they end within the page
-    // regardless of comment length, rather than guessing a fraction that
-    // happens to fit today's specific comment text.
-    const marginFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
     let annotatedCount = 0;
     const skipped = [];
@@ -70,6 +188,13 @@ app.post('/annotate', async (req, res) => {
     // Verdicts now target a SPECIFIC field (frage/antwort/fall) per row,
     // one verdict per gradable part rather than one per whole row.
     const answers = reviewData.answers || [];
+
+    // Built once per request: which rows have a column position corrupted by
+    // the duplicate-text collision, and what their X should actually be.
+    const columnRepairs = new Map([
+      ...buildColumnRepairMap(answers, 'antwort'),
+      ...buildColumnRepairMap(answers, 'fall')
+    ]);
 
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
@@ -92,20 +217,19 @@ app.post('/annotate', async (req, res) => {
       // So rather than fully replace one field with the other, take Y from
       // frage and X from the graded field, falling back to frage's own X
       // if the graded field has no coordinates at all.
-      const exerciseTypeValue = row && (row.exerciseType && row.exerciseType.value !== undefined ? row.exerciseType.value : row.exerciseType);
+      const exerciseType = fieldValue(row && row.exerciseType);
+      const subPart = fieldValue(row && row.subPart);
       const useHybridAnchor =
-        (exerciseTypeValue === 'true_false_correction' && verdict.field === 'antwort' && row.subPart !== 'b') ||
-        (exerciseTypeValue === 'case_identification' && verdict.field === 'fall') ||
-        (exerciseTypeValue === 'preposition_only' && verdict.field === 'antwort');
+        (exerciseType === 'true_false_correction' && verdict.field === 'antwort' && subPart !== 'b') ||
+        (exerciseType === 'case_identification' && verdict.field === 'fall') ||
+        (exerciseType === 'preposition_only' && verdict.field === 'antwort');
 
-      const gradedField = row && row[verdict.field];
       const frageField = row && row.frage;
-      const hasBoxes = (f) => f && f.review && f.review.boundingBoxes && f.review.boundingBoxes.length > 0;
 
-      // The field we check confidence against and treat as "the" field for
-      // page/rotation lookup - always the graded field itself, since that's
-      // what's semantically being evaluated.
-      const field = gradedField;
+      // The graded field itself is "the" field: it's what the verdict is
+      // about, so it decides confidence, page and rotation. The hybrid
+      // anchor below only ever borrows frage's row position.
+      const field = row && row[verdict.field];
 
       if (!hasBoxes(field)) {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
@@ -145,73 +269,50 @@ app.post('/annotate', async (req, res) => {
       // of rotation (per toRawCoords' own contract above), so row
       // identity is always normalized y1, and column position is always
       // normalized x1 - safe to combine here, then convert once.
-      const [gx1, gy1] = field.review.boundingBoxes[0]; // graded field's own normalized coords
-      let x1 = gx1;
-      let y1 = gy1;
+      const gradedBox = field.review.boundingBoxes[0];
+      let x1 = gradedBox[0];                 // column position: the graded field's own left edge
+      let y1 = rowAnchorY(gradedBox);        // row position: its BOTTOM edge (see rowAnchorY)
 
-      if (useHybridAnchor && hasBoxes(frageField) && frageField.review.page === field.review.page) {
-        const [, fy1] = frageField.review.boundingBoxes[0];
-        y1 = fy1; // row position from frage (always unique); column (x1) stays from the graded field
+      // If this row's box was a duplicate of another row's, its column is
+      // wrong - substitute the column learned from the uncollided rows of
+      // the same exercise (see buildColumnRepairMap).
+      const repairedX = columnRepairs.get(`${verdict.answerIndex}:${verdict.field}`);
+      if (repairedX !== undefined) {
+        x1 = repairedX;
+        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - column repaired: DocuPipe returned a duplicate box for this value, X taken from the same column on uncollided lines`);
       }
 
-      // FIX (further revised): a FIXED page-fraction margin is fragile
-      // across different scans of the SAME test - scan skew, a different
-      // crop, or slightly different paper alignment can all shift where
-      // the table actually sits as a percentage of that particular scan's
-      // page width, especially with the ~3% clearance this table's layout
-      // leaves to work with. Instead, derive the margin position from THIS
-      // SAME SCAN's own 'fall' field right edge - boundingBoxes are
-      // [x1,y1,x2,y2], and x2 (the right edge) was previously unused here.
-      // This makes the margin move WITH wherever the table actually sits
-      // on any given scan, rather than assuming every scan lines up
-      // identically.
-      if (verdict.field === 'frage') {
-        const fallField = row && row.fall;
-        const MARGIN_GAP_POINTS = 15; // desired absolute gap, in PDF points, past the Fall column's own right edge
-        if (hasBoxes(fallField) && fallField.review.page === field.review.page && fallField.review.boundingBoxes[0].length >= 4) {
-          const fallX2 = fallField.review.boundingBoxes[0][2]; // right edge of THIS row's Fall column, normalized
-          x1 = Math.min(fallX2 + (MARGIN_GAP_POINTS / width), 0.99);
-        } else {
-          // Fallback if this row has no usable 'fall' box to anchor from
-          // (shouldn't happen for qa_composition, but keeps this safe for
-          // any other future exercise type that might reuse this path) -
-          // a fixed-fraction guess as a last resort only.
-          x1 = 0.95;
-        }
+      // Only borrow frage's row position if frage itself is trustworthy -
+      // the same confidence rule applied to the graded field above. A
+      // low-confidence frage box is exactly as likely to be in the wrong
+      // place as the duplicate-text coordinate it's meant to replace.
+      if (useHybridAnchor &&
+          hasTrustedBoxes(frageField) &&
+          frageField.review.page === field.review.page) {
+        y1 = rowAnchorY(frageField.review.boundingBoxes[0]); // row position from frage (unique per row); column (x1) stays from the graded field
       }
 
+      // Every field is drawn at its own coordinate, overlapping that row's
+      // own handwriting. That is deliberate: it's how a teacher marks a
+      // paper, and it's what the antwort/fall columns already did well.
+      // Earlier attempts to push the frage mark into an external margin or
+      // to nudge it vertically both failed - this table spans nearly the
+      // full page width (no real margin exists), and nudging only traded
+      // one row's overlap for the row above's. Uniform treatment is both
+      // simpler and correct.
       let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
-      // The frage field's own Y sits at the very TOP of its row's text
-      // (where the handwritten question starts), which visually crowds
-      // right up against the row ABOVE's own Fall-column mark. Nudge it
-      // down slightly, moving it away from the boundary and toward the
-      // vertical center of its own row, rather than hugging the top edge.
-      if (verdict.field === 'frage') {
-        if (rotationAngle === 270) xPos -= 10;
-        else if (rotationAngle === 90) xPos += 10;
-        else if (rotationAngle === 180) yTop += 10;
-        else yTop -= 10;
-      }
-
       // LAST-RESORT safety net: if this mark would land essentially on top
-      // of the previously-drawn mark on this same page (within a few px in
-      // both directions), nudge it aside so it's at least visible. Unlike
-      // the frage-anchor fix above, this does NOT put the mark on its
-      // genuinely correct position - it only prevents one mark from
-      // silently hiding behind another when even the anchor field
-      // coincides. This should rarely trigger now that frage is used for
-      // the exercise types where duplicate values were the actual cause;
-      // treat any occurrence of this as a signal worth investigating rather
-      // than a real fix.
+      // of the previously-drawn mark on this page, nudge it aside so it's
+      // at least visible. This does NOT make the position correct - it only
+      // stops one mark hiding completely behind another when the hybrid
+      // anchor above couldn't separate them. Anything reported in
+      // positionWarnings is a signal to investigate, not a fix.
       const COLLISION_THRESHOLD = 4; // px
       const lastPos = lastMarkPosByPage[pageIndex];
       if (lastPos && Math.abs(xPos - lastPos.x) < COLLISION_THRESHOLD && Math.abs(yTop - lastPos.y) < COLLISION_THRESHOLD) {
-        if (rotationAngle === 270) xPos -= 14;
-        else if (rotationAngle === 90) xPos += 14;
-        else if (rotationAngle === 180) yTop += 14;
-        else yTop -= 14;
-        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - nudged: landed on top of the previous mark even after frage-anchoring; position is a visibility fix only, not confirmed correct`);
+        ({ x: xPos, y: yTop } = nudgeVisualDown(xPos, yTop, 14, rotationAngle));
+        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - nudged: landed on top of the previous mark; this is a visibility fix only, not a confirmed correct position`);
       }
       lastMarkPosByPage[pageIndex] = { x: xPos, y: yTop };
 
@@ -219,26 +320,6 @@ app.post('/annotate', async (req, res) => {
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
         ? `${verdict.pointsAwarded ?? 0}/${verdict.pointsPossible}P`
         : (verdict.isCorrect ? 'OK' : 'X');
-
-      // The right-margin frage marks need to be RIGHT-aligned (ending at
-      // RIGHT_MARGIN_X_FRACTION), not left-aligned starting there - a first
-      // attempt at this fraction as a left-aligned start position got the
-      // text clipped clean off by the page's own right edge, since text
-      // extends rightward from its start point. Right-aligning means the
-      // text always ends within the page regardless of how long a
-      // particular comment happens to be, rather than guessing a smaller
-      // start fraction that only happens to fit today's specific text.
-      const isFrageMargin = verdict.field === 'frage';
-      function shiftAlongTextDirection(x, y, distance, angle) {
-        const rad = (angle * Math.PI) / 180;
-        return { x: x + distance * Math.cos(rad), y: y + distance * Math.sin(rad) };
-      }
-      if (isFrageMargin) {
-        const labelWidth = marginFont.widthOfTextAtSize(pointsLabel, 12);
-        const shifted = shiftAlongTextDirection(xPos, yTop, -labelWidth, rotationAngle);
-        xPos = shifted.x;
-        yTop = shifted.y;
-      }
 
       // Medium confidence: the box was placed on the cited text, but that
       // text didn't read back the same as the extracted value (per Nitai -
@@ -271,28 +352,16 @@ app.post('/annotate', async (req, res) => {
         rotate: degrees(rotationAngle)
       });
 
-      // Margin marks skip the comment entirely - measured pixel evidence
-      // showed this table spans almost the full page width, leaving only
-      // ~20pt of genuine clearance past its right border. That's enough
-      // for the short point-value line, but nowhere near enough for a full
-      // comment, which would have to reach back into the Fall column's own
-      // marks regardless of right-alignment. The antwort/fall marks on the
-      // same row keep their own full comments, so the row isn't left
-      // without feedback - only the frage-specific explanation is dropped.
-      if (verdict.comment && !isFrageMargin) {
-        // Offset the comment slightly "below" the mark, in the rotated
-        // frame's own sense of down - handled by nudging along whichever
-        // raw axis corresponds to visual-down for this rotation.
-        let commentX = xPos;
-        let commentY = yTop;
-        if (rotationAngle === 270) commentX -= 12;
-        else if (rotationAngle === 90) commentX += 12;
-        else if (rotationAngle === 180) commentY += 12;
-        else commentY -= 12;
-
+      // No comment line for 'frage' verdicts: that column is the densest on
+      // the page and a second line of text is what caused the worst
+      // crowding. The mark itself (correct/incorrect + points) still shows,
+      // and antwort/fall on the same row keep their full comments, so the
+      // row is never left without feedback.
+      if (verdict.comment && verdict.field !== 'frage') {
+        const c = nudgeVisualDown(xPos, yTop, 12, rotationAngle);
         page.drawText(verdict.comment, {
-          x: commentX,
-          y: commentY,
+          x: c.x,
+          y: c.y,
           size: 7,
           color,
           rotate: degrees(rotationAngle)
@@ -306,15 +375,6 @@ app.post('/annotate', async (req, res) => {
     // of that sub-part, approximating "next to the exercise/sub-part title"
     // since we don't have a dedicated title-coordinate field - the first
     // matching answer row is the closest reliable anchor we have.
-    function getExerciseNumberValue(row) {
-      const raw = row.exerciseNumber;
-      return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
-    }
-    function getSubPartValue(row) {
-      const raw = row.subPart;
-      return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
-    }
-
     if (Array.isArray(subtotals)) {
       for (const sub of subtotals) {
         // sub.key looks like "1a", "1b", or just "2" (no sub-part letter).
@@ -324,8 +384,8 @@ app.post('/annotate', async (req, res) => {
         const exNum = parseInt(exNumStr, 10);
 
         const firstRowIndex = answers.findIndex(a => {
-          const rowExNum = getExerciseNumberValue(a);
-          const rowSubPart = getSubPartValue(a);
+          const rowExNum = fieldValue(a.exerciseNumber);
+          const rowSubPart = fieldValue(a.subPart);
           if (String(rowExNum) !== String(exNum)) return false;
           if (subPartLetter === 'a') return rowSubPart === 'a' || !rowSubPart; // null/undefined subPart defaults to 'a' by convention (matches node 21 and the true_false_correction template)
           if (subPartLetter) return rowSubPart === subPartLetter;
@@ -334,8 +394,14 @@ app.post('/annotate', async (req, res) => {
         if (firstRowIndex === -1) continue;
 
         const row = answers[firstRowIndex];
-        const anchorField = row.frage || row.antwort || row.fall;
-        if (!anchorField || !anchorField.review || !anchorField.review.boundingBoxes || anchorField.review.boundingBoxes.length === 0) continue;
+        // Pick the first field that is actually USABLE, not merely present.
+        // `row.frage || row.antwort || row.fall` looked like a fallback
+        // chain but was not: frage is a truthy object even when its
+        // boundingBoxes are null, so it always won and the subtotal was
+        // then dropped entirely, even though antwort/fall had perfectly
+        // good coordinates sitting right there.
+        const anchorField = [row.frage, row.antwort, row.fall].find(hasTrustedBoxes);
+        if (!anchorField) continue;
 
         const page = pages[anchorField.review.page - 1];
         if (!page) continue;
@@ -380,8 +446,15 @@ app.post('/annotate', async (req, res) => {
       const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
       const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
 
+      // Returning false on an untrustworthy coordinate is what makes the
+      // fallback tiers below actually work. This guards against the exact
+      // failure seen on the other exam template, where a header field
+      // reported a coordinate that pointed at the instructions paragraph
+      // instead of the header box - a wrong coordinate cannot be nudged
+      // into a right one, so the only safe move is to decline it and let
+      // the next tier try.
       function drawAtField(field, text, yNudge) {
-        if (!field || !field.review || !field.review.boundingBoxes || field.review.boundingBoxes.length === 0) return false;
+        if (!hasTrustedBoxes(field)) return false;
         const page = pages[field.review.page - 1];
         if (!page) return false;
         const { width, height } = page.getSize();
