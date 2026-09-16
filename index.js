@@ -9,13 +9,26 @@
 // Output: { annotatedPdfBase64 }
 
 const express = require('express');
-const { PDFDocument, rgb, degrees } = require('pdf-lib');
+const { PDFDocument, rgb, degrees, StandardFonts } = require('pdf-lib');
+
+// Point values come out of an even division (3 points over 4.5 answers), so
+// they arrive as things like 0.6667 or 0.625. Two decimals is plenty on a
+// marked page, and String() drops the trailing zeros so 0.5 stays "0.5"
+// and 1 stays "1" rather than becoming "0.50" and "1.00".
+function fmtPoints(n) {
+  if (n === null || n === undefined) return '?';
+  return String(Math.round(Number(n) * 100) / 100);
+}
 
 const app = express();
 
 // Point size of every score mark. Shared so the vertical anchoring maths
 // and the actual drawText call can never drift apart.
 const MARK_FONT_SIZE = 12;
+
+// Per-exercise subtotals are drawn larger and bold so they read as a
+// summary line rather than as just another per-answer mark.
+const SUBTOTAL_FONT_SIZE = 12;
 
 // Exam PDFs with images can be large - raise the body size limit.
 app.use(express.json({ limit: '25mb' }));
@@ -279,6 +292,35 @@ app.post('/annotate', async (req, res) => {
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const pages = pdfDoc.getPages();
 
+    // Embedded once, so label widths can be measured properly rather than
+    // estimated from character counts. Bold is used for the per-exercise
+    // subtotals, which should stand out from the individual marks.
+    const labelFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const labelFontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    // Draws a score with a highlight behind it. Marks sit directly on top of
+    // the student's handwriting, so green or red text alone can be hard to
+    // pick out against dense blue ink. A near-opaque white pad knocks the
+    // handwriting back just enough for the number to read cleanly, while
+    // leaving it faintly visible underneath rather than blanking it out.
+    // The pad is measured from the real glyph width, so it always fits the
+    // text exactly and never over-covers the page.
+    function drawLabel(page, text, x, y, size, color, rotationAngle, font) {
+      const f = font || labelFont;
+      const w = f.widthOfTextAtSize(text, size);
+      page.drawRectangle({
+        x: x - 2,
+        y: y - 0.22 * size,
+        width: w + 4,
+        height: size * 1.18,
+        color: rgb(1, 1, 1),
+        opacity: 0.92,
+        rotate: degrees(rotationAngle)
+      });
+      page.drawText(text, { x, y, size, font: f, color, rotate: degrees(rotationAngle) });
+      return w;
+    }
+
     let annotatedCount = 0;
     const skipped = [];
     const positionWarnings = [];
@@ -457,52 +499,33 @@ app.post('/annotate', async (req, res) => {
 
       const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
-        ? `${verdict.pointsAwarded ?? 0}/${verdict.pointsPossible}P`
+        ? `${fmtPoints(verdict.pointsAwarded ?? 0)}/${fmtPoints(verdict.pointsPossible)}P`
         : (verdict.isCorrect ? 'OK' : 'X');
+
+      // Comments are deliberately not drawn. A second line of small text
+      // under every mark was the single biggest source of clutter: it
+      // collided with the row below in tight tables and ran across into the
+      // neighbouring column in multi-column exercises. The score and its
+      // colour carry the verdict; the wording lives in the workflow output
+      // if it's ever needed.
+      const labelWidth = drawLabel(page, pointsLabel, xPos, yTop, MARK_FONT_SIZE, color, rotationAngle);
 
       // Medium confidence: the box was placed on the cited text, but that
       // text didn't read back the same as the extracted value (per Nitai -
       // often an OCR/handwriting mismatch, or the model itself was unsure).
-      // The location is usually right, just not confirmed - draw a dashed
-      // orange outline around the mark so a teacher knows to double-check
-      // this specific one, without hiding it entirely like "low" does.
+      // The location is usually right, just not confirmed - outline the mark
+      // so a teacher knows to double-check this one, without hiding it
+      // entirely like "low" does. Drawn after the label so the outline sits
+      // on top of the highlight rather than under it.
       if (isMediumConfidence) {
-        const labelWidthEstimate = pointsLabel.length * 12 * 0.6 + 6;
         page.drawRectangle({
           x: xPos - 3,
-          y: yTop - 3,
-          width: labelWidthEstimate,
-          height: 12 + 4,
+          y: yTop - 0.28 * MARK_FONT_SIZE,
+          width: labelWidth + 6,
+          height: MARK_FONT_SIZE * 1.3,
           borderColor: rgb(0.95, 0.6, 0),
           borderWidth: 1.2,
           borderDashArray: [3, 2],
-          rotate: degrees(rotationAngle)
-        });
-      }
-
-      // Text must be drawn rotated by the SAME angle as the page rotation,
-      // so it appears upright (not sideways/upside-down) once the page's
-      // own rotation is applied for viewing - empirically confirmed.
-      page.drawText(pointsLabel, {
-        x: xPos,
-        y: yTop,
-        size: MARK_FONT_SIZE,
-        color,
-        rotate: degrees(rotationAngle)
-      });
-
-      // No comment line for 'frage' verdicts: that column is the densest on
-      // the page and a second line of text is what caused the worst
-      // crowding. The mark itself (correct/incorrect + points) still shows,
-      // and antwort/fall on the same row keep their full comments, so the
-      // row is never left without feedback.
-      if (verdict.comment && verdict.field !== 'frage') {
-        const c = nudgeVisualDown(xPos, yTop, 12, rotationAngle);
-        page.drawText(verdict.comment, {
-          x: c.x,
-          y: c.y,
-          size: 7,
-          color,
           rotate: degrees(rotationAngle)
         });
       }
@@ -561,8 +584,7 @@ app.post('/annotate', async (req, res) => {
         const [x1, y1] = anchorField.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
 
-        const possibleText = sub.possible !== null && sub.possible !== undefined ? sub.possible : '?';
-        const subtotalText = `${sub.awarded}P / ${possibleText}P`;
+        const subtotalText = `${fmtPoints(sub.awarded)}P / ${fmtPoints(sub.possible)}P`;
         let subX = x;
         let subY = y;
         if (rotationAngle === 270) subX += 40;
@@ -577,12 +599,10 @@ app.post('/annotate', async (req, res) => {
         const stackIndex = subtotalsDrawnPerRow[firstRowIndex] || 0;
         subtotalsDrawnPerRow[firstRowIndex] = stackIndex + 1;
         if (stackIndex > 0) {
-          ({ x: subX, y: subY } = nudgeVisualDown(subX, subY, stackIndex * 14, rotationAngle));
+          ({ x: subX, y: subY } = nudgeVisualDown(subX, subY, stackIndex * (SUBTOTAL_FONT_SIZE + 4), rotationAngle));
         }
 
-        page.drawText(subtotalText, {
-          x: subX, y: subY, size: 11, color: rgb(0, 0, 0.6), rotate: degrees(rotationAngle)
-        });
+        drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, rgb(0, 0, 0.6), rotationAngle, labelFontBold);
       }
     }
 
@@ -600,7 +620,7 @@ app.post('/annotate', async (req, res) => {
     // coordinates - falling back to a corner of the last page otherwise.
     if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
       const swissGrade = computeSwissGrade(totalPointsAwarded, totalPointsPossible);
-      const scoreText = `${totalPointsAwarded}P / ${totalPointsPossible}P`;
+      const scoreText = `${fmtPoints(totalPointsAwarded)}P / ${fmtPoints(totalPointsPossible)}P`;
       const gradeText = swissGrade !== null ? `${swissGrade}` : '';
 
       const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
@@ -621,7 +641,7 @@ app.post('/annotate', async (req, res) => {
         const rotationAngle = page.getRotation().angle;
         const [x1, y1] = field.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
-        page.drawText(text, { x, y: y + (yNudge || 0), size: 12, color: rgb(0, 0, 0.7), rotate: degrees(rotationAngle) });
+        drawLabel(page, text, x, y + (yNudge || 0), 12, rgb(0, 0, 0.7), rotationAngle);
         return true;
       }
 
