@@ -13,6 +13,10 @@ const { PDFDocument, rgb, degrees } = require('pdf-lib');
 
 const app = express();
 
+// Point size of every score mark. Shared so the vertical anchoring maths
+// and the actual drawText call can never drift apart.
+const MARK_FONT_SIZE = 12;
+
 // Exam PDFs with images can be large - raise the body size limit.
 app.use(express.json({ limit: '25mb' }));
 
@@ -176,18 +180,25 @@ function buildJudgmentColumnMap(answers) {
 // Which part of a bounding box the mark's baseline should sit on.
 //
 // boundingBoxes are [x1, y1, x2, y2] with a top-left origin, so y1 is the
-// box TOP and y2 its BOTTOM. drawText places the BASELINE at the y it's
-// given and the glyphs grow upward from there - so anchoring on the box top
-// renders the whole mark ABOVE the field it belongs to. In a roomy layout
-// that reads as a tidy annotation above the line; in a tight table row
-// (Aufgabe 5's rows are ~13pt tall, about one line of 12pt text) it puts
-// the mark completely outside its own row, which is why row 1's mark landed
-// on the table header and row 6's on the row-5 divider.
-// Anchoring on the box BOTTOM instead makes the glyphs fill the box upward,
-// so the mark sits INSIDE the field it grades. Falls back to the top for
-// any box that doesn't report all four values.
-function rowAnchorY(box) {
-  return box && box.length >= 4 ? box[3] : box[1];
+// box TOP and y2 its BOTTOM. drawText places the BASELINE at the y it is
+// given and the glyphs grow upward from there, so anchoring on the box top
+// renders the whole mark ABOVE the field it belongs to - which is how
+// Aufgabe 5's row 1 ended up on the table header.
+//
+// Anchoring on the bottom fixed that but overshot for multi-line fields: a
+// three-line handwritten question is one tall box, and its bottom is the
+// LAST line, so the mark landed on the final line of the question, right
+// against the next row.
+//
+// What we actually want is the FIRST line of the field: drop one line-height
+// below the box top, then clamp so a short box can never push the mark out
+// through its own bottom. Single-line boxes are barely affected (their
+// height is about one line anyway); tall boxes get the mark at the top,
+// where a teacher would write it.
+function rowAnchorY(box, lineHeightNorm) {
+  if (!box) return 0;
+  if (box.length < 4) return box[1];
+  return Math.min(box[3], box[1] + lineHeightNorm);
 }
 
 // Moves a raw PDF point "visually down" the page by `distance`, for any page
@@ -314,8 +325,15 @@ app.post('/annotate', async (req, res) => {
       // identity is always normalized y1, and column position is always
       // normalized x1 - safe to combine here, then convert once.
       const gradedBox = field.review.boundingBoxes[0];
-      let x1 = gradedBox[0];                 // column position: the graded field's own left edge
-      let y1 = rowAnchorY(gradedBox);        // row position: its BOTTOM edge (see rowAnchorY)
+
+      // One line of mark text, expressed in the same normalized units as the
+      // boxes. Normalized Y maps onto the page's raw HEIGHT for an upright
+      // page, but onto its WIDTH once the page carries a 90/270 rotate flag,
+      // so the divisor follows the rotation.
+      const lineHeightNorm = MARK_FONT_SIZE / ((rotationAngle === 90 || rotationAngle === 270) ? width : height);
+
+      let x1 = gradedBox[0];                          // column position: the graded field's own left edge
+      let y1 = rowAnchorY(gradedBox, lineHeightNorm);  // row position: first line of the field
 
       // If this row's box was a duplicate of another row's, its column is
       // wrong - substitute the column learned from the uncollided rows of
@@ -328,14 +346,18 @@ app.post('/annotate', async (req, res) => {
 
       // 'markAs' (set by node 19z for true_false_correction) says which half
       // of a merged "Falsch, vom" answer this verdict is about:
-      //   judgment  -> belongs in the Richtig/Falsch table column
-      //   correction-> belongs on the correction word out in the sentence
-      // A correction mark therefore wants the antwort box exactly as-is,
-      // including its own Y, because the correction is written on its own
-      // line under the sentence rather than on the frage line.
-      const isCorrectionMark = verdict.markAs === 'correction';
+      //   correction -> belongs on the correction word out in the sentence
+      //   anything else -> the Richtig/Falsch judgment, which belongs in the
+      //                    table column
+      // The test is deliberately "is it a correction?" rather than "is it
+      // exactly the string judgment?", mirroring node 21's own pooling rule.
+      // A model that writes "judgement", or omits markAs on a row it merged
+      // into one verdict, then still lands in the table instead of silently
+      // reverting to the raw box position.
+      const isTrueFalse = exerciseType === 'true_false_correction';
+      const isCorrectionMark = isTrueFalse && verdict.markAs === 'correction';
 
-      if (verdict.markAs === 'judgment') {
+      if (isTrueFalse && !isCorrectionMark) {
         const cols = judgmentColumns.get(String(fieldValue(row && row.exerciseNumber)));
         if (cols && cols.size) {
           const answerText = String(fieldValue(field) || '');
@@ -361,7 +383,7 @@ app.post('/annotate', async (req, res) => {
           !isCorrectionMark &&
           hasTrustedBoxes(frageField) &&
           frageField.review.page === field.review.page) {
-        y1 = rowAnchorY(frageField.review.boundingBoxes[0]); // row position from frage (unique per row); column (x1) stays from the graded field
+        y1 = rowAnchorY(frageField.review.boundingBoxes[0], lineHeightNorm); // row position from frage (unique per row); column (x1) stays from the graded field
       }
 
       // Every field is drawn at its own coordinate, overlapping that row's
@@ -419,7 +441,7 @@ app.post('/annotate', async (req, res) => {
       page.drawText(pointsLabel, {
         x: xPos,
         y: yTop,
-        size: 12,
+        size: MARK_FONT_SIZE,
         color,
         rotate: degrees(rotationAngle)
       });
