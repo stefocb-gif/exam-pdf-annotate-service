@@ -149,21 +149,26 @@ app.post('/annotate', async (req, res) => {
         y1 = fy1; // row position from frage (always unique); column (x1) stays from the graded field
       }
 
-      let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
-
-      // SIMPLE FIX: a verdict for the 'frage' field itself (e.g.
+      // FIX (revised): a verdict for the 'frage' field itself (e.g.
       // qa_composition, where the student handwrites their own question)
-      // anchors exactly where that handwritten text sits - drawing right on
-      // top of it. Nudge it up and off the text, into the small gap above
-      // the line, the same way the comment offset below already does for
-      // "below the mark" - just applied here as "above the frage text"
-      // before anything is drawn.
+      // anchors exactly where that handwritten text sits. A first attempt
+      // nudged it up by a fixed amount, but real output showed this table's
+      // rows are packed too tightly for that to find any actual empty
+      // space - it just traded one collision (its own row's text) for
+      // another (the row above's text), landing on top of something
+      // either way.
+      // Fixed properly this time: keep the row's own Y (still correct),
+      // but move X out to the page's outer right margin entirely, well
+      // past the table's own columns - the same "reliable row, dedicated
+      // clear column" approach already proven for the Hörverstehen
+      // service. This sidesteps the dense-table problem outright instead
+      // of hunting for a gap that may not exist.
+      const RIGHT_MARGIN_X_FRACTION = 0.95; // first-pass estimate for this table's outer margin - not yet visually confirmed
       if (verdict.field === 'frage') {
-        if (rotationAngle === 270) xPos += 16;
-        else if (rotationAngle === 90) xPos -= 16;
-        else if (rotationAngle === 180) yTop -= 16;
-        else yTop += 16;
+        x1 = RIGHT_MARGIN_X_FRACTION;
       }
+
+      let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
       // LAST-RESORT safety net: if this mark would land essentially on top
       // of the previously-drawn mark on this same page (within a few px in
