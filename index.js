@@ -9,7 +9,7 @@
 // Output: { annotatedPdfBase64 }
 
 const express = require('express');
-const { PDFDocument, rgb, degrees } = require('pdf-lib');
+const { PDFDocument, rgb, degrees, StandardFonts } = require('pdf-lib');
 
 const app = express();
 
@@ -56,6 +56,11 @@ app.post('/annotate', async (req, res) => {
     const pdfBytes = Buffer.from(pdfBase64, 'base64');
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const pages = pdfDoc.getPages();
+    // Embedded once so the right-margin frage marks can be right-aligned
+    // (measuring real text width), guaranteeing they end within the page
+    // regardless of comment length, rather than guessing a fraction that
+    // happens to fit today's specific comment text.
+    const marginFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
     let annotatedCount = 0;
     const skipped = [];
@@ -196,6 +201,32 @@ app.post('/annotate', async (req, res) => {
         ? `${verdict.pointsAwarded ?? 0}/${verdict.pointsPossible}P`
         : (verdict.isCorrect ? 'OK' : 'X');
 
+      // The right-margin frage marks need to be RIGHT-aligned (ending at
+      // RIGHT_MARGIN_X_FRACTION), not left-aligned starting there - a first
+      // attempt at this fraction as a left-aligned start position got the
+      // text clipped clean off by the page's own right edge, since text
+      // extends rightward from its start point. Right-aligning means the
+      // text always ends within the page regardless of how long a
+      // particular comment happens to be, rather than guessing a smaller
+      // start fraction that only happens to fit today's specific text.
+      const isFrageMargin = verdict.field === 'frage';
+      function shiftAlongTextDirection(x, y, distance, angle) {
+        const rad = (angle * Math.PI) / 180;
+        return { x: x + distance * Math.cos(rad), y: y + distance * Math.sin(rad) };
+      }
+      // Keep the original (pre-shift) anchor too - the comment line below
+      // is a DIFFERENT length of text than pointsLabel, so it needs its own
+      // independent right-alignment from the same anchor point, not a
+      // reuse of pointsLabel's already-shifted position.
+      const marginAnchorX = xPos;
+      const marginAnchorY = yTop;
+      if (isFrageMargin) {
+        const labelWidth = marginFont.widthOfTextAtSize(pointsLabel, 12);
+        const shifted = shiftAlongTextDirection(xPos, yTop, -labelWidth, rotationAngle);
+        xPos = shifted.x;
+        yTop = shifted.y;
+      }
+
       // Medium confidence: the box was placed on the cited text, but that
       // text didn't read back the same as the extracted value (per Nitai -
       // often an OCR/handwriting mismatch, or the model itself was unsure).
@@ -237,6 +268,24 @@ app.post('/annotate', async (req, res) => {
         else if (rotationAngle === 90) commentX += 12;
         else if (rotationAngle === 180) commentY += 12;
         else commentY -= 12;
+
+        // Margin comments are usually the LONGER line and the one most at
+        // risk of running off the page - right-align independently from
+        // the same original anchor, using the comment's own measured
+        // width (not pointsLabel's, and not a reuse of pointsLabel's
+        // already-shifted x).
+        if (isFrageMargin) {
+          const commentWidth = marginFont.widthOfTextAtSize(verdict.comment, 7);
+          let belowAnchorX = marginAnchorX;
+          let belowAnchorY = marginAnchorY;
+          if (rotationAngle === 270) belowAnchorX -= 12;
+          else if (rotationAngle === 90) belowAnchorX += 12;
+          else if (rotationAngle === 180) belowAnchorY += 12;
+          else belowAnchorY -= 12;
+          const shiftedComment = shiftAlongTextDirection(belowAnchorX, belowAnchorY, -commentWidth, rotationAngle);
+          commentX = shiftedComment.x;
+          commentY = shiftedComment.y;
+        }
 
         page.drawText(verdict.comment, {
           x: commentX,
