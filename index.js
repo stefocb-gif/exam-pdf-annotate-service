@@ -30,9 +30,9 @@ const MARK_FONT_SIZE = 10;
 // summary line rather than as just another per-answer mark.
 const SUBTOTAL_FONT_SIZE = 12;
 
-// The header total and final grade are drawn at the same weight and size as
-// the subtotals, so the three summary numbers on the page read as one set.
-const HEADER_FONT_SIZE = 12;
+// The header total and final grade are drawn bold and slightly larger than
+// the subtotals, so the two headline numbers stand out at the top of page 1.
+const HEADER_FONT_SIZE = 14;
 
 // Row-count warnings sit under their subtotal and must not compete with it
 // for attention, so they are drawn smaller.
@@ -538,6 +538,127 @@ function fieldColumnStart(answers, exerciseKey, fieldName) {
   return s[Math.floor(s.length / 2)];
 }
 
+// MISSING BLANK POSITION - a fill-in answer DocuPipe could not locate.
+//
+// Seen on Aufgabe 6 row 4 ("Ich freue mich über ___ Erfolg."): the answer
+// "jeden" came back with no box (confidence low), so its mark was skipped.
+//
+// The blank's position is recoverable from the sentence itself. Its left
+// edge sits after the printed text in front of "___", and printed text has
+// known proportions. The OTHER rows of the same exercise, whose answers were
+// located, give the scale: how far their blank sits from their sentence's
+// left edge versus how wide their prefix text is. One scale fitted across
+// those rows, applied to this row's own prefix, gives this row's blank.
+// Measured on the paper that showed the problem: the fitted estimate landed
+// within 0.006 of the real answer on two rows and within 0.026 on the third.
+const BLANK_MARKER = /_{2,}|…|\.{3,}/;
+
+function inferMissingBlankBoxes(answers, warnings, font) {
+  const byExercise = new Map();
+  answers.forEach((row, idx) => {
+    if (!row) return;
+    const ex = String(fieldValue(row.exerciseNumber));
+    if (!byExercise.has(ex)) byExercise.set(ex, []);
+    byExercise.get(ex).push(idx);
+  });
+
+  const prefixOf = (row) => {
+    const text = fieldValue(row.frage);
+    if (typeof text !== 'string') return null;
+    const m = text.match(BLANK_MARKER);
+    return m ? text.slice(0, m.index) : null;
+  };
+
+  for (const [, idxs] of byExercise) {
+    const samples = [];
+    for (const i of idxs) {
+      const row = answers[i];
+      const prefix = prefixOf(row);
+      if (prefix === null || !hasTrustedBoxes(row.frage) || !hasTrustedBoxes(row.antwort)) continue;
+      if (row.frage.review.page !== row.antwort.review.page) continue;
+      const dx = row.antwort.review.boundingBoxes[0][0] - row.frage.review.boundingBoxes[0][0];
+      const w = font.widthOfTextAtSize(prefix, 1);
+      if (dx < 0 || w <= 0) continue;
+      samples.push({ w, dx, box: row.antwort.review.boundingBoxes[0] });
+    }
+    if (samples.length < 2) continue;
+    const scale = samples.reduce((n, s) => n + s.w * s.dx, 0) / samples.reduce((n, s) => n + s.w * s.w, 0);
+    const widths = samples.map(s => s.box[2] - s.box[0]).sort((a, b) => a - b);
+    const boxWidth = widths[Math.floor(widths.length / 2)];
+
+    for (const i of idxs) {
+      const row = answers[i];
+      if (hasTrustedBoxes(row.antwort) || !hasTrustedBoxes(row.frage)) continue;
+      const prefix = prefixOf(row);
+      if (prefix === null) continue;
+      const fb = row.frage.review.boundingBoxes[0];
+      const x = fb[0] + scale * font.widthOfTextAtSize(prefix, 1);
+      row.antwort = {
+        value: fieldValue(row.antwort),
+        review: {
+          page: row.frage.review.page,
+          boundingBoxes: [[x, fb[1], x + boxWidth, fb[3]]],
+          confidence: 'medium',
+          inferred: true
+        }
+      };
+      warnings.push(`answerIndex ${i}, field antwort - DocuPipe gave no position for this answer; blank position estimated from the sentence text and the other rows of the exercise`);
+    }
+  }
+}
+
+// FLOWN CASE BOX - a 'fall' box that landed far outside its column.
+//
+// Seen on Aufgabe 6 row 3: the case "Genitiv" was boxed at x=0.286, out in
+// the sentence area, while every other row's case sat in the "Fall:" column
+// around x=0.72. Its mark therefore appeared next to the NEXT row's answer,
+// where it looked like that row's score. The general column repair did not
+// catch it: with only four rows, a single wild value makes the spread look
+// too wide to count as a column at all.
+//
+// So this check asks a simpler question, only of 'fall' (a case is always
+// written in a case column, never inside running text): do most rows agree
+// on one column, and is this box a quarter of a page away from it? If so the
+// box is wrong in both directions - it carries some other spot's height too
+// - so the column comes from the agreeing rows and the height from the row's
+// own sentence.
+function repairFlownFallBoxes(answers, warnings) {
+  const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+  const byExercise = new Map();
+  answers.forEach((row, idx) => {
+    if (!row || !hasTrustedBoxes(row.fall)) return;
+    const ex = String(fieldValue(row.exerciseNumber));
+    if (!byExercise.has(ex)) byExercise.set(ex, []);
+    byExercise.get(ex).push(idx);
+  });
+
+  for (const [, idxs] of byExercise) {
+    if (idxs.length < 3) continue;
+    const xs = idxs.map(i => answers[i].fall.review.boundingBoxes[0][0]);
+    const m = med(xs);
+    const inliers = xs.filter(x => Math.abs(x - m) <= 0.1);
+    if (inliers.length < 2 || inliers.length / xs.length < 0.6) continue;
+    const columnX = med(inliers);
+
+    for (const i of idxs) {
+      const row = answers[i];
+      const b = row.fall.review.boundingBoxes[0];
+      if (Math.abs(b[0] - columnX) <= LARGE_COLUMN_OUTLIER) continue;
+      if (!hasTrustedBoxes(row.frage) || row.frage.review.page !== row.fall.review.page) continue;
+      const fb = row.frage.review.boundingBoxes[0];
+      row.fall = {
+        value: fieldValue(row.fall),
+        review: {
+          ...row.fall.review,
+          boundingBoxes: [[columnX, fb[1], columnX + (b[2] - b[0]), fb[3]]],
+          inferred: true
+        }
+      };
+      warnings.push(`answerIndex ${i}, field fall - box was far outside the case column (x=${b[0].toFixed(3)}); moved to the column on this row`);
+    }
+  }
+}
+
 function nudgeVisualDown(x, y, distance, rotationAngle) {
   switch (rotationAngle) {
     case 270: return { x: x - distance, y };
@@ -605,6 +726,8 @@ app.post('/annotate', async (req, res) => {
     // object, and that must never leak back into the caller's data.
     const answers = (reviewData.answers || []).map(r => (r ? { ...r } : r));
     inferMissingFrageBoxes(answers, positionWarnings);
+    inferMissingBlankBoxes(answers, positionWarnings, labelFont);
+    repairFlownFallBoxes(answers, positionWarnings);
     const mergedSplits = buildMergedSplitMap(answers);
 
     // Built once per request: which rows have a column position corrupted by
@@ -1016,7 +1139,7 @@ app.post('/annotate', async (req, res) => {
     if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
       const swissGrade = computeSwissGrade(totalPointsAwarded, totalPointsPossible);
       const scoreText = `${fmtPoints(totalPointsAwarded)}P / ${fmtPoints(totalPointsPossible)}P`;
-      const gradeText = swissGrade !== null ? `${swissGrade}` : '';
+      const gradeText = swissGrade !== null ? Number(swissGrade).toFixed(1) : ''; // always one decimal: 4.0, 4.5
 
       const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
       const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
@@ -1041,7 +1164,27 @@ app.post('/annotate', async (req, res) => {
       }
 
       const punkteDrawn = drawAtField(punkteField, scoreText, 0);
-      const noteDrawn = drawAtField(noteField, gradeText, 0);
+      // The grade goes BESIDE the handwritten grade, vertically centred on it.
+      // The Note cell holds the teacher's own grade (often circled), and its
+      // box top sits right under the Punkte row - drawing from that top edge
+      // put "4.0" over "/ 43 P" once the grade was set at 14pt.
+      function drawBesideField(field, text) {
+        if (!hasTrustedBoxes(field)) return false;
+        const page = pages[field.review.page - 1];
+        if (!page) return false;
+        const { width, height } = page.getSize();
+        const rotationAngle = page.getRotation().angle;
+        const [, y1, x2, y2] = field.review.boundingBoxes[0];
+        const sideways = rotationAngle === 90 || rotationAngle === 270;
+        const visualW = sideways ? height : width;
+        const visualH = sideways ? width : height;
+        const gapNorm = 6 / visualW;
+        const baselineNorm = (y1 + y2) / 2 + (0.35 * HEADER_FONT_SIZE) / visualH;
+        const { x, y } = toRawCoords(x2 + gapNorm, baselineNorm, width, height, rotationAngle);
+        drawLabel(page, text, x, y, HEADER_FONT_SIZE, rgb(0, 0, 0.7), rotationAngle, labelFontBold);
+        return true;
+      }
+      const noteDrawn = drawBesideField(noteField, gradeText);
 
       // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
       // OCR'd content yet, so Review may not report coordinates for them.
