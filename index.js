@@ -151,6 +151,30 @@ function buildColumnRepairMap(answers, fieldName) {
   });
 
   for (const [exerciseKey, lines] of byExercise) {
+    // Rows are grouped by frage box to work out which of them share a
+    // printed line. That only holds if the frage boxes are trustworthy, and
+    // sometimes they are not: on one paper two different questions in
+    // Aufgabe 1 came back with a byte-identical frage box, which made the
+    // grouping believe they were two answers on one line and pushed the
+    // second into a "column" with a single sample - too few to judge, so its
+    // misplaced answer was never repaired.
+    //
+    // If MOST lines in the exercise hold exactly one row, the exercise is
+    // one answer per line and a shared frage box is an artefact rather than
+    // a real shared line. Split those groups apart so every row sits in the
+    // one real column. Exercises that genuinely put two answers on a line
+    // (Aufgabe 2) have most lines holding two rows, and are left alone.
+    const singles = [...lines.values()].filter(v => v.length === 1).length;
+    const multis = [...lines.values()].filter(v => v.length > 1).length;
+    if (multis > 0 && singles > multis) {
+      const flattened = new Map();
+      let k = 0;
+      for (const [, idxs] of lines) {
+        for (const i of idxs) flattened.set('row' + (k++), [i]);
+      }
+      lines.clear();
+      for (const [key, v] of flattened) lines.set(key, v);
+    }
     // Learn column positions, using only lines whose boxes are all present
     // and all distinct - a collided line would teach the wrong position.
     const columnX = new Map(); // ordinal -> [x1, ...]
@@ -212,19 +236,26 @@ function buildColumnRepairMap(answers, fieldName) {
         const x = g.review.boundingBoxes[0][0];
         if (Math.abs(x - median) <= threshold) continue;
 
-        // Being far from its own column is NOT enough to call a box wrong.
-        // Where an exercise has two answer columns but the extraction merged
-        // each line into a single row, the surviving answers are a
-        // legitimate mix of both columns - and "repairing" the ones that
-        // came from the second column would move correct marks to the wrong
-        // place. What actually marks a box as broken is that it has landed
-        // inside ANOTHER field's column: the Aufgabe 1 answer returned at
-        // x=0.0979, sitting in the Frage column at ~0.085. So require the
-        // outlier to coincide with a different field's column before
-        // touching it.
-        const drifted = otherFieldMedians(answers, exerciseKey, fieldName)
-          .some(m => Math.abs(x - m) < MIN_COLUMN_OUTLIER);
-        if (!drifted) continue;
+        // Being far from its own column is NOT enough to call an ANSWER box
+        // wrong. Where an exercise has two answer columns but the extraction
+        // merged each line into one row, the surviving answers are a
+        // legitimate mix of both columns, and "repairing" the ones from the
+        // second column would move correct marks to the wrong place. So for
+        // antwort and fall, require the outlier to have landed inside
+        // another field's column - which is what a genuinely broken box
+        // does, like the Aufgabe 1 answer returned at x=0.0979 sitting in
+        // the Frage column.
+        //
+        // 'frage' is exempt: it is the question or sentence, always a single
+        // leftmost column in every exercise type here, so it has no second
+        // column to be legitimately far from - and being leftmost, it can
+        // never drift INTO another field's column either, which would
+        // otherwise make it unrepairable by the rule above.
+        if (fieldName !== 'frage') {
+          const drifted = otherFieldMedians(answers, exerciseKey, fieldName)
+            .some(m => Math.abs(x - m) < MIN_COLUMN_OUTLIER);
+          if (!drifted) continue;
+        }
 
         repaired.set(key, median);
       }
@@ -687,19 +718,19 @@ app.post('/annotate', async (req, res) => {
         const labelW = labelFontBold.widthOfTextAtSize(subtotalText, SUBTOTAL_FONT_SIZE);
         const marginPt = textStartNorm * ((rotationAngle === 90 || rotationAngle === 270) ? height : width);
 
-        let subX, subY;
-        if (marginPt - labelW - 4 >= 2) {
-          // Fits in the margin: right-align it to end just before the text.
-          const pos = toRawCoords(textStartNorm, anchorY, width, height, rotationAngle);
-          const rad = (rotationAngle * Math.PI) / 180;
-          subX = pos.x - (labelW + 4) * Math.cos(rad);
-          subY = pos.y - (labelW + 4) * Math.sin(rad);
-        } else {
-          // Margin too narrow on this page - keep the old placement rather
-          // than push the label off the edge.
-          const pos = toRawCoords(anchorBox[0], anchorBox[1], width, height, rotationAngle);
-          ({ x: subX, y: subY } = nudgeVisualDown(pos.x, pos.y, -20, rotationAngle));
-        }
+        // Right-align the label so it ends just before the exercise's text.
+        // Where the margin is a little too narrow the label is clamped to
+        // the page edge instead, which lets it overlap the first character
+        // or two - deliberately. The alternative, falling back to drawing
+        // above the anchor row, is what put this label on the table's
+        // "Frage" header and lifted Aufgabe 3's into Aufgabe 2. A slight
+        // overlap on the correct row beats a clean position on the wrong
+        // one.
+        const shift = Math.min(labelW + 3, Math.max(marginPt - 1, 0));
+        const pos = toRawCoords(textStartNorm, anchorY, width, height, rotationAngle);
+        const rad = (rotationAngle * Math.PI) / 180;
+        let subX = pos.x - shift * Math.cos(rad);
+        let subY = pos.y - shift * Math.sin(rad);
 
         // Two sub-parts can now share one anchor row (see the fallback
         // above), which would stack "2.5P / 3P" and "3P / 3P" on the exact
