@@ -34,6 +34,10 @@ const SUBTOTAL_FONT_SIZE = 12;
 // the subtotals, so the three summary numbers on the page read as one set.
 const HEADER_FONT_SIZE = 12;
 
+// Row-count warnings sit under their subtotal and must not compete with it
+// for attention, so they are drawn smaller.
+const WARNING_FONT_SIZE = 8;
+
 // Exam PDFs with images can be large - raise the body size limit.
 app.use(express.json({ limit: '25mb' }));
 
@@ -90,7 +94,22 @@ function hasTrustedBoxes(f) {
 // Measured on real scans: genuine columns vary by under 0.02, while the
 // scattered blanks of a running-text exercise vary by 0.15 and upwards.
 const COLUMN_TIGHTNESS = 0.02;
-const MIN_COLUMN_OUTLIER = 0.05;
+const MIN_COLUMN_OUTLIER = 0.035;
+
+// A box can be off its column by a little or by a lot, and the two mean
+// different things. A small offset is box jitter - the extraction found the
+// right answer and boxed it slightly loosely - and snapping it to the column
+// is safe. A large offset may instead be a legitimate second answer column
+// that the extraction merged into one row per line, where snapping would
+// move a correct mark. So small offsets are repaired outright; large ones
+// must also have drifted into another field's column before we touch them.
+const SMALL_COLUMN_OFFSET = 0.08;
+
+// How close a box's left edge must be to its sentence's left edge to count
+// as having collapsed onto the sentence start. Not zero: the frage box
+// often includes the printed item number ("2."), so a collapsed answer box
+// starts at the first word rather than exactly at the frage edge.
+const COLLAPSE_START_TOLERANCE = 0.035;
 
 // Median x of every OTHER field in one exercise - i.e. where the other
 // columns of this exercise actually sit. Used to tell a genuinely broken box
@@ -251,7 +270,7 @@ function buildColumnRepairMap(answers, fieldName) {
         // column to be legitimately far from - and being leftmost, it can
         // never drift INTO another field's column either, which would
         // otherwise make it unrepairable by the rule above.
-        if (fieldName !== 'frage') {
+        if (fieldName !== 'frage' && Math.abs(x - median) > SMALL_COLUMN_OFFSET) {
           const drifted = otherFieldMedians(answers, exerciseKey, fieldName)
             .some(m => Math.abs(x - m) < MIN_COLUMN_OUTLIER);
           if (!drifted) continue;
@@ -404,9 +423,14 @@ app.post('/annotate', async (req, res) => {
 
     // Built once per request: which rows have a column position corrupted by
     // the duplicate-text collision, and what their X should actually be.
+    // All three graded fields need repairing, not just the answers. 'frage'
+    // carries its own verdict in qa_composition, and its box drifts the same
+    // way the others do - on one paper it came back indented at x=0.2151
+    // instead of the column's 0.0873.
     const columnRepairs = new Map([
       ...buildColumnRepairMap(answers, 'antwort'),
-      ...buildColumnRepairMap(answers, 'fall')
+      ...buildColumnRepairMap(answers, 'fall'),
+      ...buildColumnRepairMap(answers, 'frage')
     ]);
     const judgmentColumns = buildJudgmentColumnMap(answers);
 
@@ -509,7 +533,7 @@ app.post('/annotate', async (req, res) => {
       let rightAlignMark = false;
       const frageBox = hasTrustedBoxes(frageField) ? frageField.review.boundingBoxes[0] : null;
       if (frageBox && frageBox.length >= 4 && gradedBox.length >= 4 &&
-          Math.abs(gradedBox[0] - frageBox[0]) < 0.005 &&
+          Math.abs(gradedBox[0] - frageBox[0]) < COLLAPSE_START_TOLERANCE &&
           gradedBox[2] < frageBox[2] - 0.005) {
         x1 = gradedBox[2];
         rightAlignMark = true;
@@ -522,6 +546,13 @@ app.post('/annotate', async (req, res) => {
       const repairedX = columnRepairs.get(`${verdict.answerIndex}:${verdict.field}`);
       if (repairedX !== undefined) {
         x1 = repairedX;
+        // A column repair supersedes the collapse handling: it gives an
+        // absolute position learned from the other rows, so the label must
+        // start there rather than be pulled back to end at a right edge we
+        // are no longer using. Both can fire on the same box - a collapsed
+        // box is also an outlier - and combining them would shift the mark
+        // one label-width left of its column.
+        rightAlignMark = false;
         positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - column repaired: DocuPipe returned a duplicate box for this value, X taken from the same column on uncollided lines`);
       }
 
@@ -743,6 +774,17 @@ app.post('/annotate', async (req, res) => {
         }
 
         drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, rgb(0, 0, 0.6), rotationAngle, labelFontBold);
+
+        // Row-count warning from node 21: the extraction returned fewer rows
+        // for this exercise than the reference has, which means some of the
+        // student's answers were never graded at all. That makes the score
+        // itself wrong rather than just the annotation, so it has to be
+        // visible on the page - a missing answer leaves no other trace.
+        // Amber rather than red, since it flags "check this", not "wrong".
+        if (sub.warning) {
+          const warnPos = nudgeVisualDown(subX, subY, SUBTOTAL_FONT_SIZE + 2, rotationAngle);
+          drawLabel(page, sub.warning, warnPos.x, warnPos.y, WARNING_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold);
+        }
       }
     }
 
