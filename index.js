@@ -416,6 +416,128 @@ function rowAnchorY(box, lineHeightNorm) {
 // encodes. Centralised because getting it wrong fails silently: the mark
 // still draws, just drifting in the wrong direction. Pass a negative
 // distance to move visually up.
+// MISSING ROW POSITION - a row whose own 'frage' has no usable box.
+//
+// Seen on Aufgabe 1b row 3 ("Wem schenkt Lisa ..."): DocuPipe returned no
+// box at all for the question (confidence low), and its 'antwort' was cited
+// to the word "Freund?" in the ROW ABOVE. With no frage, the frage verdict
+// was skipped, and nothing could tell that the antwort box sat in the wrong
+// row - containment and column repair both need a frage to work from.
+//
+// The row's position is still in the data. Rows are listed in page order,
+// so a row must sit BETWEEN the frage of the row before it and the frage of
+// the row after it. A sibling box (antwort/fall) that lies in that gap is
+// on the right row; one that lies inside a neighbour's band is not. From a
+// sibling in the gap we take the row's height, and from the other rows of
+// the exercise we take the frage column's left edge and typical width.
+//
+// The result is marked confidence "medium", so the mark is drawn with the
+// dashed "please check" outline rather than looking fully confirmed.
+function inferMissingFrageBoxes(answers, warnings) {
+  const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+  const byExercise = new Map();
+  answers.forEach((row, idx) => {
+    if (!row) return;
+    const ex = String(fieldValue(row.exerciseNumber));
+    if (!byExercise.has(ex)) byExercise.set(ex, []);
+    byExercise.get(ex).push(idx);
+  });
+
+  for (const [, idxs] of byExercise) {
+    const trusted = idxs.filter(i => hasTrustedBoxes(answers[i].frage));
+    if (trusted.length < 2) continue;
+    const colX = med(trusted.map(i => answers[i].frage.review.boundingBoxes[0][0]));
+    const colW = med(trusted.map(i => { const b = answers[i].frage.review.boundingBoxes[0]; return b[2] - b[0]; }));
+
+    idxs.forEach((i, pos) => {
+      const row = answers[i];
+      if (hasTrustedBoxes(row.frage)) return;
+      const prev = idxs.slice(0, pos).reverse().find(j => hasTrustedBoxes(answers[j].frage));
+      const next = idxs.slice(pos + 1).find(j => hasTrustedBoxes(answers[j].frage));
+
+      const inGap = [row.antwort, row.fall].filter(hasTrustedBoxes).find(f => {
+        const b = f.review.boundingBoxes[0];
+        const mid = (b[1] + b[3]) / 2;
+        if (prev !== undefined) {
+          const pf = answers[prev].frage.review;
+          if (pf.page === f.review.page && mid <= pf.boundingBoxes[0][3]) return false;
+        }
+        if (next !== undefined) {
+          const nf = answers[next].frage.review;
+          if (nf.page === f.review.page && mid >= nf.boundingBoxes[0][1]) return false;
+        }
+        return true;
+      });
+      if (!inGap) return;
+
+      const b = inGap.review.boundingBoxes[0];
+      row.frage = {
+        value: fieldValue(row.frage),
+        review: {
+          page: inGap.review.page,
+          boundingBoxes: [[colX, b[1], colX + colW, b[3]]],
+          confidence: 'medium',
+          inferred: true
+        }
+      };
+      warnings.push(`answerIndex ${i}, field frage - DocuPipe gave no position for this question; row position inferred from this row's own answer boxes (marked for checking)`);
+    });
+  }
+}
+
+// MERGED ANSWERS - one extracted row holding several answers ("Nominativ,
+// Akkusativ"). DocuPipe boxes the whole run, from the first answer's left
+// edge to the last answer's right edge. When grading returns one verdict per
+// answer (verdict.part = 0, 1, ...), each needs its own spot inside that
+// box. The printed answer lines in these exercises are equal-width columns,
+// so answer k starts k/N of the way across. The exercise-wide median of left
+// edge and width is used, rather than each row's own, so the marks form
+// straight columns even though handwriting length varies from row to row.
+function buildMergedSplitMap(answers) {
+  const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+  const groups = new Map(); // "exercise|field|N" -> { x1s, ws }
+  answers.forEach(row => {
+    if (!row) return;
+    for (const fieldName of ['antwort', 'fall']) {
+      const f = row[fieldName];
+      if (!hasTrustedBoxes(f)) continue;
+      const n = countParts(fieldValue(f));
+      if (n < 2) continue;
+      const b = f.review.boundingBoxes[0];
+      const key = `${fieldValue(row.exerciseNumber)}|${fieldName}|${n}`;
+      if (!groups.has(key)) groups.set(key, { x1s: [], ws: [] });
+      groups.get(key).x1s.push(b[0]);
+      groups.get(key).ws.push(b[2] - b[0]);
+    }
+  });
+  const out = new Map();
+  for (const [key, g] of groups) {
+    if (g.x1s.length < 2) continue; // a single row gives no column to align to
+    out.set(key, { x1: med(g.x1s), w: med(g.ws) });
+  }
+  return out;
+}
+
+function countParts(v) {
+  if (typeof v !== 'string' || !v.includes(',')) return 1;
+  return v.split(',').filter(t => t.trim()).length;
+}
+
+// Median left edge of one field across an exercise - roughly where that
+// column starts. Deliberately NOT required to be a tight column: it is only
+// used once a box has already been proven to sit in the wrong row, where the
+// start of the right column beats every other available x.
+function fieldColumnStart(answers, exerciseKey, fieldName) {
+  const xs = [];
+  answers.forEach(row => {
+    if (!row || String(fieldValue(row.exerciseNumber)) !== String(exerciseKey)) return;
+    if (hasTrustedBoxes(row[fieldName])) xs.push(row[fieldName].review.boundingBoxes[0][0]);
+  });
+  if (xs.length < 3) return null;
+  const s = xs.sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
 function nudgeVisualDown(x, y, distance, rotationAngle) {
   switch (rotationAngle) {
     case 270: return { x: x - distance, y };
@@ -479,7 +601,11 @@ app.post('/annotate', async (req, res) => {
 
     // Verdicts now target a SPECIFIC field (frage/antwort/fall) per row,
     // one verdict per gradable part rather than one per whole row.
-    const answers = reviewData.answers || [];
+    // Shallow copy per row: inferMissingFrageBoxes replaces a row's 'frage'
+    // object, and that must never leak back into the caller's data.
+    const answers = (reviewData.answers || []).map(r => (r ? { ...r } : r));
+    inferMissingFrageBoxes(answers, positionWarnings);
+    const mergedSplits = buildMergedSplitMap(answers);
 
     // Built once per request: which rows have a column position corrupted by
     // the duplicate-text collision, and what their X should actually be.
@@ -549,7 +675,7 @@ app.post('/annotate', async (req, res) => {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (low confidence coordinate - not trustworthy, skipped per Nitai's recommendation)`);
         continue;
       }
-      const isMediumConfidence = confidence === 'medium';
+      let isMediumConfidence = confidence === 'medium';
 
       const pageIndex = field.review.page - 1;
       const page = pages[pageIndex];
@@ -640,6 +766,17 @@ app.post('/annotate', async (req, res) => {
       // A model that writes "judgement", or omits markAs on a row it merged
       // into one verdict, then still lands in the table instead of silently
       // reverting to the raw box position.
+      // One verdict per answer inside a merged row (see buildMergedSplitMap).
+      // Only applies when grading actually said which answer it is about;
+      // a single verdict for the whole merged row keeps its old position.
+      const partCount = countParts(fieldValue(field));
+      if (Number.isInteger(verdict.part) && partCount > 1 && verdict.part < partCount) {
+        const key = `${fieldValue(row && row.exerciseNumber)}|${verdict.field}|${partCount}`;
+        const split = mergedSplits.get(key) || { x1: gradedBox[0], w: gradedBox[2] - gradedBox[0] };
+        x1 = split.x1 + (split.w * verdict.part) / partCount;
+        rightAlignMark = false;
+      }
+
       const isTrueFalse = exerciseType === 'true_false_correction';
       const isCorrectionMark = isTrueFalse && verdict.markAs === 'correction';
 
@@ -704,9 +841,18 @@ app.post('/annotate', async (req, res) => {
           // is not where the correction is written - we have no coordinate
           // for that - but it is the right row and the right cell, which is
           // as far as the data honestly goes.
-          x1 = frageBox[0];
+          // Exception: an answer or case box in the wrong row (Aufgabe 1b,
+          // where "ihrem Freund" was boxed on "Freund?" one row up). Here
+          // the field has its own column, so taking the sentence's x would
+          // stack this mark on top of the frage mark. Start of its own
+          // column on the correct row instead.
+          const ownColumn = (!isTrueFalse && verdict.field !== 'frage')
+            ? fieldColumnStart(answers, fieldValue(row && row.exerciseNumber), verdict.field)
+            : null;
+          x1 = ownColumn !== null ? ownColumn : frageBox[0];
           y1 = rowAnchorY(frageBox, lineHeightNorm);
           rightAlignMark = false;
+          isMediumConfidence = true; // repaired position - flag for checking
           positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - box sat outside its own row (probably cited to matching printed text elsewhere); position taken from the sentence instead`);
         }
       }
