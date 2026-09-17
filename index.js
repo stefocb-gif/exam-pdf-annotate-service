@@ -108,6 +108,21 @@ const MIN_COLUMN_OUTLIER = 0.035;
 // must also have drifted into another field's column before we touch them.
 const SMALL_COLUMN_OFFSET = 0.08;
 
+// Beyond this the box has not drifted to a neighbouring column, it has flown
+// to another part of the page entirely. Measured: the widest legitimate gap
+// between two adjacent answer columns is 0.174, while a box that landed in
+// the sentence area sat 0.43 from its column. No plausible second column is
+// a quarter of a page away, so past this distance no further evidence is
+// needed before repairing.
+const LARGE_COLUMN_OUTLIER = 0.25;
+
+// How far outside its own sentence a mark may sit before the row is judged
+// wrong. Measured on a real paper: a correction written under its sentence
+// sat 0.0005 below it, while a box mis-cited to the table header sat 0.139
+// above. Generous below, tight above.
+const CONTAINMENT_ABOVE = 0.02;
+const CONTAINMENT_BELOW = 0.06;
+
 // How close a box's left edge must be to its sentence's left edge to count
 // as having collapsed onto the sentence start. Not zero: the frage box
 // often includes the printed item number ("2."), so a collapsed answer box
@@ -294,7 +309,8 @@ function buildColumnRepairMap(answers, fieldName) {
         const g = answers[i] && answers[i][fieldName];
         if (!hasBoxes(g)) continue;
         const x = g.review.boundingBoxes[0][0];
-        if (Math.abs(x - median) <= threshold) continue;
+        const deviation = Math.abs(x - median);
+        if (deviation <= MIN_COLUMN_OUTLIER) continue;
 
         // Being far from its own column is NOT enough to call an ANSWER box
         // wrong. Where an exercise has two answer columns but the extraction
@@ -311,7 +327,9 @@ function buildColumnRepairMap(answers, fieldName) {
         // column to be legitimately far from - and being leftmost, it can
         // never drift INTO another field's column either, which would
         // otherwise make it unrepairable by the rule above.
-        if (fieldName !== 'frage' && Math.abs(x - median) > SMALL_COLUMN_OFFSET) {
+        if (fieldName !== 'frage' &&
+            deviation > SMALL_COLUMN_OFFSET &&
+            deviation <= LARGE_COLUMN_OUTLIER) {
           const drifted = otherFieldMedians(answers, exerciseKey, fieldName)
             .some(m => Math.abs(x - m) < MIN_COLUMN_OUTLIER);
           if (!drifted) continue;
@@ -320,6 +338,7 @@ function buildColumnRepairMap(answers, fieldName) {
         repaired.set(key, median);
       }
     }
+
   }
   return repaired;
 }
@@ -662,6 +681,27 @@ app.post('/annotate', async (req, res) => {
       // full page width (no real margin exists), and nudging only traded
       // one row's overlap for the row above's. Uniform treatment is both
       // simpler and correct.
+      // CONTAINMENT - a mark must land on its own row.
+      //
+      // Because handwriting is absent from the page's text layer, the
+      // extraction cites whatever printed text matches the value. One
+      // "Falsch, dem" was therefore boxed onto the printed word "Falsch" in
+      // the table header, a third of a page above its own sentence, at
+      // confidence high. No column logic catches that - the column was fine,
+      // the ROW was wrong.
+      //
+      // The row's frage says where the row is. A correction is written under
+      // its sentence, so allow generous room below, but essentially none
+      // above: nothing legitimately sits above the line it belongs to.
+      if (frageBox && frageBox.length >= 4) {
+        const above = frageBox[1] - CONTAINMENT_ABOVE;
+        const below = frageBox[3] + CONTAINMENT_BELOW;
+        if (y1 < above || y1 > below) {
+          y1 = rowAnchorY(frageBox, lineHeightNorm);
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - box sat outside its own row (probably cited to matching printed text elsewhere); row position taken from the sentence instead`);
+        }
+      }
+
       let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
       // LAST-RESORT safety net: if this mark would land essentially on top
