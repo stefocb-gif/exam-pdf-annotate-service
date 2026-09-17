@@ -697,8 +697,17 @@ app.post('/annotate', async (req, res) => {
         const above = frageBox[1] - CONTAINMENT_ABOVE;
         const below = frageBox[3] + CONTAINMENT_BELOW;
         if (y1 < above || y1 > below) {
+          // A box that landed on another row is wrong in BOTH axes, not just
+          // vertically: the one cited to the header carried that header
+          // cell's x as well, so repairing only the row left the mark in the
+          // Falsch column. Take the whole position from the sentence. That
+          // is not where the correction is written - we have no coordinate
+          // for that - but it is the right row and the right cell, which is
+          // as far as the data honestly goes.
+          x1 = frageBox[0];
           y1 = rowAnchorY(frageBox, lineHeightNorm);
-          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - box sat outside its own row (probably cited to matching printed text elsewhere); row position taken from the sentence instead`);
+          rightAlignMark = false;
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - box sat outside its own row (probably cited to matching printed text elsewhere); position taken from the sentence instead`);
         }
       }
 
