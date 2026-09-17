@@ -111,6 +111,44 @@ const SMALL_COLUMN_OFFSET = 0.08;
 // starts at the first word rather than exactly at the frage edge.
 const COLLAPSE_START_TOLERANCE = 0.035;
 
+// Rows whose 'frage' box is byte-identical to another row's in the same
+// exercise. DocuPipe sometimes hands two different questions the same box -
+// on one paper rows 1 and 2 of Aufgabe 1 both came back at y1=0.366 - and a
+// duplicated frage is wrong about the ROW, not just the column. The column
+// repair cannot help, because it only ever substitutes an x. Any row listed
+// here must take its row position from one of its own sibling fields
+// instead, which are unique to it.
+function buildDuplicateFrageSet(answers) {
+  const byExercise = new Map();
+  answers.forEach((row, idx) => {
+    if (!hasBoxes(row && row.frage)) return;
+    const ex = String(fieldValue(row.exerciseNumber));
+    const sig = row.frage.review.boundingBoxes[0].join(',');
+    if (!byExercise.has(ex)) byExercise.set(ex, new Map());
+    const sigs = byExercise.get(ex);
+    if (!sigs.has(sig)) sigs.set(sig, []);
+    sigs.get(sig).push(idx);
+  });
+
+  const dupes = new Set();
+  for (const [, sigs] of byExercise) {
+    // Sharing a frage box is not automatically wrong. Where an exercise puts
+    // two answers on one printed line (Aufgabe 2, two marked objects per
+    // sentence) every line is legitimately shared, and the shared box is the
+    // only thing that tells those two answers apart vertically - treating it
+    // as broken there would undo that. So only call it an artefact when the
+    // exercise normally holds ONE row per line and a shared box is therefore
+    // the exception rather than the rule.
+    const singles = [...sigs.values()].filter(v => v.length === 1).length;
+    const multis = [...sigs.values()].filter(v => v.length > 1).length;
+    if (singles <= multis) continue;
+    for (const [, idxs] of sigs) {
+      if (idxs.length > 1) idxs.forEach(i => dupes.add(i));
+    }
+  }
+  return dupes;
+}
+
 // Median x of every OTHER field in one exercise - i.e. where the other
 // columns of this exercise actually sit. Used to tell a genuinely broken box
 // (one that has drifted into a different field's column) from a box that is
@@ -433,6 +471,7 @@ app.post('/annotate', async (req, res) => {
       ...buildColumnRepairMap(answers, 'frage')
     ]);
     const judgmentColumns = buildJudgmentColumnMap(answers);
+    const duplicateFrageRows = buildDuplicateFrageSet(answers);
 
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
@@ -518,6 +557,19 @@ app.post('/annotate', async (req, res) => {
       let x1 = gradedBox[0];                          // column position: the graded field's own left edge
       let y1 = rowAnchorY(gradedBox, lineHeightNorm);  // row position: first line of the field
 
+      // A duplicated 'frage' box points at the wrong ROW, so a frage verdict
+      // drawn against it lands on whichever row won the duplicate. The row's
+      // own antwort and fall boxes are unique to it and carry the right
+      // vertical position, so borrow one of those instead - only the row,
+      // the column still comes from frage.
+      if (verdict.field === 'frage' && duplicateFrageRows.has(verdict.answerIndex)) {
+        const sibling = [row && row.antwort, row && row.fall].find(hasTrustedBoxes);
+        if (sibling && sibling.review.page === field.review.page) {
+          y1 = rowAnchorY(sibling.review.boundingBoxes[0], lineHeightNorm);
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field frage - frage box is shared with another row, so the row position was taken from this row's own answer instead`);
+        }
+      }
+
       // COLLAPSED BOX: the answer's box starts at exactly the same x as its
       // own sentence and ends before the sentence does - i.e. it spans
       // "sentence start .. end of the answer" rather than just the answer.
@@ -593,6 +645,7 @@ app.post('/annotate', async (req, res) => {
       // place as the duplicate-text coordinate it's meant to replace.
       if (useHybridAnchor &&
           !isCorrectionMark &&
+          !duplicateFrageRows.has(verdict.answerIndex) &&
           hasTrustedBoxes(frageField) &&
           frageField.review.page === field.review.page) {
         y1 = rowAnchorY(frageField.review.boundingBoxes[0], lineHeightNorm); // row position from frage (unique per row); column (x1) stays from the graded field
