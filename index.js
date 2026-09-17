@@ -431,8 +431,8 @@ function rowAnchorY(box, lineHeightNorm) {
 // sibling in the gap we take the row's height, and from the other rows of
 // the exercise we take the frage column's left edge and typical width.
 //
-// The result is marked confidence "medium", so the mark is drawn with the
-// dashed "please check" outline rather than looking fully confirmed.
+// The inferred box is tagged confidence "medium" and inferred: true, so it
+// can be told apart from a box DocuPipe reported itself.
 function inferMissingFrageBoxes(answers, warnings) {
   const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
   const byExercise = new Map();
@@ -480,7 +480,7 @@ function inferMissingFrageBoxes(answers, warnings) {
           inferred: true
         }
       };
-      warnings.push(`answerIndex ${i}, field frage - DocuPipe gave no position for this question; row position inferred from this row's own answer boxes (marked for checking)`);
+      warnings.push(`answerIndex ${i}, field frage - DocuPipe gave no position for this question; row position inferred from this row's own answer boxes`);
     });
   }
 }
@@ -675,7 +675,6 @@ app.post('/annotate', async (req, res) => {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (low confidence coordinate - not trustworthy, skipped per Nitai's recommendation)`);
         continue;
       }
-      let isMediumConfidence = confidence === 'medium';
 
       const pageIndex = field.review.page - 1;
       const page = pages[pageIndex];
@@ -852,7 +851,6 @@ app.post('/annotate', async (req, res) => {
           x1 = ownColumn !== null ? ownColumn : frageBox[0];
           y1 = rowAnchorY(frageBox, lineHeightNorm);
           rightAlignMark = false;
-          isMediumConfidence = true; // repaired position - flag for checking
           positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - box sat outside its own row (probably cited to matching printed text elsewhere); position taken from the sentence instead`);
         }
       }
@@ -895,27 +893,8 @@ app.post('/annotate', async (req, res) => {
         yTop -= w * Math.sin(rad);
       }
 
-      const labelWidth = drawLabel(page, pointsLabel, xPos, yTop, MARK_FONT_SIZE, color, rotationAngle);
+      drawLabel(page, pointsLabel, xPos, yTop, MARK_FONT_SIZE, color, rotationAngle);
 
-      // Medium confidence: the box was placed on the cited text, but that
-      // text didn't read back the same as the extracted value (per Nitai -
-      // often an OCR/handwriting mismatch, or the model itself was unsure).
-      // The location is usually right, just not confirmed - outline the mark
-      // so a teacher knows to double-check this one, without hiding it
-      // entirely like "low" does. Drawn after the label so the outline sits
-      // on top of the highlight rather than under it.
-      if (isMediumConfidence) {
-        page.drawRectangle({
-          x: xPos - 3,
-          y: yTop - 0.28 * MARK_FONT_SIZE,
-          width: labelWidth + 6,
-          height: MARK_FONT_SIZE * 1.3,
-          borderColor: rgb(0.95, 0.6, 0),
-          borderWidth: 1.2,
-          borderDashArray: [3, 2],
-          rotate: degrees(rotationAngle)
-        });
-      }
 
       annotatedCount++;
     }
