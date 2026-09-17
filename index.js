@@ -38,6 +38,9 @@ const HEADER_FONT_SIZE = 12;
 // for attention, so they are drawn smaller.
 const WARNING_FONT_SIZE = 8;
 
+// Distance in points from the page's left edge at which subtotals are drawn.
+const SUBTOTAL_LEFT_INSET = 2;
+
 // Exam PDFs with images can be large - raise the body size limit.
 app.use(express.json({ limit: '25mb' }));
 
@@ -778,43 +781,26 @@ app.post('/annotate', async (req, res) => {
         // what lets the label fit in the page's left margin below.
         const subtotalText = `${fmtPoints(sub.awarded)}/${fmtPoints(sub.possible)}P`;
 
-        // Where the exercise's own text block begins - the leftmost edge of
-        // any usable box in this exercise. Everything left of that is blank
-        // margin, measured from this scan rather than assumed, so it follows
-        // whatever crop or skew the page happens to have.
-        let textStartNorm = anchorBox[0];
-        answers.forEach(a => {
-          if (String(fieldValue(a.exerciseNumber)) !== String(exNum)) return;
-          [a.frage, a.antwort, a.fall].forEach(f => {
-            if (hasTrustedBoxes(f) && f.review.page === anchorField.review.page) {
-              textStartNorm = Math.min(textStartNorm, f.review.boundingBoxes[0][0]);
-            }
-          });
-        });
-
-        // Draw at the anchor row's OWN height, not above it. The previous
-        // 20pt upward offset is what pushed a subtotal out of its own
-        // exercise: Aufgabe 3's anchor is its instruction line, so lifting
-        // the label clear of that line landed it inside Aufgabe 2. Sitting
-        // level with the anchor keeps every subtotal inside the exercise it
-        // belongs to.
+        // Subtotals sit at a FIXED inset from the page's left edge.
+        //
+        // Inferring the margin from the fields does not work here. In a
+        // table with a leading "Nr." column, nothing in that column is an
+        // extracted field, so the leftmost field is the sentence in the
+        // SECOND column and the label lands on the row numbers. Widening the
+        // measurement to the whole page does not help either: on the page
+        // holding Aufgabe 5 and 6, every single field starts to the right of
+        // the table border, so the border is simply not visible in the data.
+        //
+        // A fixed inset needs no inference. Printed content on these pages
+        // begins around 44pt, so a label starting at 2pt clears it, and all
+        // subtotals line up in one column down the edge. The inset is given
+        // in points and converted through the usual transform, so it stays
+        // at the visual left edge on a rotated page too.
         const anchorY = rowAnchorY(anchorBox, lineHeightNorm);
-        const labelW = labelFontBold.widthOfTextAtSize(subtotalText, SUBTOTAL_FONT_SIZE);
-        const marginPt = textStartNorm * ((rotationAngle === 90 || rotationAngle === 270) ? height : width);
-
-        // Right-align the label so it ends just before the exercise's text.
-        // Where the margin is a little too narrow the label is clamped to
-        // the page edge instead, which lets it overlap the first character
-        // or two - deliberately. The alternative, falling back to drawing
-        // above the anchor row, is what put this label on the table's
-        // "Frage" header and lifted Aufgabe 3's into Aufgabe 2. A slight
-        // overlap on the correct row beats a clean position on the wrong
-        // one.
-        const shift = Math.min(labelW + 3, Math.max(marginPt - 1, 0));
-        const pos = toRawCoords(textStartNorm, anchorY, width, height, rotationAngle);
-        const rad = (rotationAngle * Math.PI) / 180;
-        let subX = pos.x - shift * Math.cos(rad);
-        let subY = pos.y - shift * Math.sin(rad);
+        const insetNorm = SUBTOTAL_LEFT_INSET / ((rotationAngle === 90 || rotationAngle === 270) ? height : width);
+        const pos = toRawCoords(insetNorm, anchorY, width, height, rotationAngle);
+        let subX = pos.x;
+        let subY = pos.y;
 
         // Two sub-parts can now share one anchor row (see the fallback
         // above), which would stack "2.5P / 3P" and "3P / 3P" on the exact
