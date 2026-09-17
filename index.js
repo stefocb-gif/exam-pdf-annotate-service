@@ -61,7 +61,7 @@ app.get('/', (req, res) => {
 
 app.post('/annotate', async (req, res) => {
   try {
-    const { pdfBase64, reviewData, verdicts, totalPointsAwarded, totalPointsPossible, subtotals } = req.body;
+    const { pdfBase64, reviewData, verdicts, totalPointsAwarded, totalPointsPossible, subtotals, gradeRounding, bonusPoints } = req.body;
 
     if (!pdfBase64 || !reviewData || !verdicts) {
       return res.status(400).json({
@@ -380,13 +380,22 @@ app.post('/annotate', async (req, res) => {
       }
     }
 
-    // Compute a Swiss grade (1-6 scale) from the totals, rounded to the
-    // nearest 0.5 - standard Swiss school convention.
+    // Swiss grade as calculated by Escola:
+    //   Note = (erreichte Punkte + Bonuspunkte) / maximale Punkte * 5 + 1
+    // rounded to the step the teacher picked in the form (0.1 = Zehntel,
+    // 0.5 = halbe Noten, ...). Without those fields: step 0.5, no bonus.
+    const GRADE_STEP = Number(gradeRounding) > 0 ? Number(gradeRounding) : 0.5;
+    const BONUS_POINTS = Number(bonusPoints) || 0;
     function computeSwissGrade(awarded, possible) {
       if (!possible) return null;
-      const raw = 1 + 5 * (awarded / possible);
-      const rounded = Math.round(raw * 2) / 2;
+      const raw = 1 + 5 * ((Number(awarded) + BONUS_POINTS) / possible);
+      const rounded = Math.round(raw / GRADE_STEP) * GRADE_STEP;
       return Math.max(1, Math.min(6, rounded));
+    }
+    // As many decimals as the step needs, at least one: 5.3 / 5.0 / 5.25.
+    function formatGrade(g) {
+      const stepDecimals = (String(GRADE_STEP).split('.')[1] || '').length;
+      return Number(g).toFixed(Math.max(1, stepDecimals));
     }
 
     let headerFieldsDebug = null;
@@ -422,7 +431,7 @@ app.post('/annotate', async (req, res) => {
     if (totalPointsAwarded !== undefined && totalPointsPossible !== undefined) {
       const swissGrade = computeSwissGrade(totalPointsAwarded, totalPointsPossible);
       const scoreText = `${totalPointsAwarded}P/${totalPointsPossible}P`;
-      const gradeText = swissGrade !== null ? `Note: ${swissGrade}` : '';
+      const gradeText = swissGrade !== null ? `Note: ${formatGrade(swissGrade)}` : '';
 
       const headerPage = pages[HEADER_PAGE_INDEX];
       let punkteDrawn = false;
