@@ -518,9 +518,13 @@ function buildMergedSplitMap(answers) {
   return out;
 }
 
+// Answers written side by side come back joined as "Nominativ, Akkusativ"
+// on some papers and "Nominativ / Akkusativ" on others.
+const PART_SEPARATOR = /[,\/;]/;
+
 function countParts(v) {
-  if (typeof v !== 'string' || !v.includes(',')) return 1;
-  return v.split(',').filter(t => t.trim()).length;
+  if (typeof v !== 'string' || !PART_SEPARATOR.test(v)) return 1;
+  return v.split(PART_SEPARATOR).filter(t => t.trim()).length;
 }
 
 // Median left edge of one field across an exercise - roughly where that
@@ -659,6 +663,101 @@ function repairFlownFallBoxes(answers, warnings) {
   }
 }
 
+// A box can be present and "trusted" yet say nothing about where the answer
+// is. Seen on Aufgabe 5: one correction came back boxed across the entire
+// table (x 0.09 to 0.91, three rows tall). Anything that wide is a region,
+// not an answer, and is handled as if no box had been returned.
+const MAX_ANSWER_BOX_WIDTH = 0.6;
+
+function isUsableAnswerBox(field) {
+  if (!hasTrustedBoxes(field)) return false;
+  const b = field.review.boundingBoxes[0];
+  return (b[2] - b[0]) <= MAX_ANSWER_BOX_WIDTH;
+}
+
+function hasValue(field) {
+  const v = fieldValue(field);
+  return v !== null && v !== undefined && String(v).trim() !== '';
+}
+
+// MISSING ANSWER/CASE POSITION - the row is known, the box is not.
+//
+// Runs after the frage and blank inference, so every row that can have a
+// known sentence position already has one. For each answer or case that
+// still has no usable box, the position is rebuilt from what IS known:
+//
+//   - The ROW always comes from the row's own sentence (frage).
+//   - The COLUMN depends on the kind of exercise:
+//       qa_composition (table) and the "Fall:" column of fill_blank_with_case:
+//         the column the other rows of the exercise agree on.
+//       fill_blank_with_case answer whose sentence carries no "___" marker:
+//         the start of the sentence - the blank's place cannot be derived
+//         without the marker, and the right row is the part that matters.
+//       true_false_correction: the judgment mark is moved into the
+//         Richtig/Falsch column later anyway; a correction mark goes just
+//         after the end of its sentence, where it is clearly that
+//         sentence's and collides with nothing.
+//
+// Seen on one paper: Aufgabe 1a row 2's answer, Aufgabe 5 row 5 (no box at
+// all, so both its judgment and correction marks vanished), Aufgabe 5 row 3
+// (the table-wide box), and Aufgabe 6 row 3's answer.
+const INFER_TYPES = ['qa_composition', 'fill_blank_with_case', 'true_false_correction'];
+
+function inferMissingFieldBoxes(answers, warnings) {
+  const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+
+  // Column per exercise and field, from the rows that agree with each other.
+  const columnOf = (exerciseKey, fieldName) => {
+    const boxes = [];
+    answers.forEach(r => {
+      if (!r || String(fieldValue(r.exerciseNumber)) !== exerciseKey) return;
+      if (isUsableAnswerBox(r[fieldName]) && !r[fieldName].review.inferred) boxes.push(r[fieldName].review.boundingBoxes[0]);
+    });
+    if (boxes.length < 2) return null;
+    const m = med(boxes.map(b => b[0]));
+    const inliers = boxes.filter(b => Math.abs(b[0] - m) <= 0.1);
+    if (inliers.length < 2 || inliers.length / boxes.length < 0.6) return null;
+    return { x: med(inliers.map(b => b[0])), w: med(inliers.map(b => b[2] - b[0])) };
+  };
+
+  answers.forEach((row, i) => {
+    if (!row) return;
+    const type = fieldValue(row.exerciseType);
+    if (!INFER_TYPES.includes(type)) return;
+    if (!hasTrustedBoxes(row.frage)) return;
+    const exerciseKey = String(fieldValue(row.exerciseNumber));
+    const fb = row.frage.review.boundingBoxes[0];
+    const page = row.frage.review.page;
+
+    for (const fieldName of ['antwort', 'fall']) {
+      const f = row[fieldName];
+      if (!hasValue(f) || isUsableAnswerBox(f)) continue;
+
+      let box = null;
+      let how = '';
+      if (type === 'true_false_correction') {
+        if (fieldName !== 'antwort') continue;
+        box = [fb[2] + 0.01, fb[1], fb[2] + 0.08, fb[3]];
+        how = 'correction placed after the end of its sentence, judgment in the table column';
+      } else if (type === 'fill_blank_with_case' && fieldName === 'antwort') {
+        box = [fb[0], fb[1], fb[0] + 0.08, fb[3]];
+        how = 'placed at the start of its sentence (no blank marker to locate the gap)';
+      } else {
+        const col = columnOf(exerciseKey, fieldName);
+        if (!col) continue;
+        box = [col.x, fb[1], col.x + col.w, fb[3]];
+        how = `placed in the ${fieldName} column on this row`;
+      }
+
+      row[fieldName] = {
+        value: fieldValue(f),
+        review: { page, boundingBoxes: [box], confidence: 'medium', inferred: true }
+      };
+      warnings.push(`answerIndex ${i}, field ${fieldName} - no usable position from DocuPipe; ${how}`);
+    }
+  });
+}
+
 function nudgeVisualDown(x, y, distance, rotationAngle) {
   switch (rotationAngle) {
     case 270: return { x: x - distance, y };
@@ -728,6 +827,7 @@ app.post('/annotate', async (req, res) => {
     inferMissingFrageBoxes(answers, positionWarnings);
     inferMissingBlankBoxes(answers, positionWarnings, labelFont);
     repairFlownFallBoxes(answers, positionWarnings);
+    inferMissingFieldBoxes(answers, positionWarnings);
     const mergedSplits = buildMergedSplitMap(answers);
 
     // Built once per request: which rows have a column position corrupted by
@@ -767,17 +867,33 @@ app.post('/annotate', async (req, res) => {
       // if the graded field has no coordinates at all.
       const exerciseType = fieldValue(row && row.exerciseType);
       const subPart = fieldValue(row && row.subPart);
+
+      // In case_identification antwort and fall hold the same answer, and
+      // which of the two DocuPipe fills varies from paper to paper - one
+      // paper had every case in 'antwort' with 'fall' empty. A verdict
+      // naming the empty one is still about the filled one, so position it
+      // there instead of dropping the mark.
+      let posField = verdict.field;
+      if (exerciseType === 'case_identification' && row && !hasBoxes(row[posField])) {
+        const other = posField === 'fall' ? 'antwort' : 'fall';
+        if (hasBoxes(row[other])) posField = other;
+      }
+
       const useHybridAnchor =
-        (exerciseType === 'true_false_correction' && verdict.field === 'antwort' && subPart !== 'b') ||
-        (exerciseType === 'case_identification' && verdict.field === 'fall') ||
-        (exerciseType === 'preposition_only' && verdict.field === 'antwort');
+        (exerciseType === 'true_false_correction' && posField === 'antwort' && subPart !== 'b') ||
+        (exerciseType === 'case_identification' && (posField === 'fall' || posField === 'antwort')) ||
+        (exerciseType === 'preposition_only' && posField === 'antwort') ||
+        // Blank and "Fall:" line sit on the sentence's own line. Taking the
+        // row from the sentence keeps two rows with the same case ("Dativ",
+        // boxed once for both) on their own lines.
+        (exerciseType === 'fill_blank_with_case' && (posField === 'antwort' || posField === 'fall'));
 
       const frageField = row && row.frage;
 
       // The graded field itself is "the" field: it's what the verdict is
       // about, so it decides confidence, page and rotation. The hybrid
       // anchor below only ever borrows frage's row position.
-      const field = row && row[verdict.field];
+      const field = row && row[posField];
 
       if (!hasBoxes(field)) {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
@@ -865,7 +981,12 @@ app.post('/annotate', async (req, res) => {
       // If this row's box was a duplicate of another row's, its column is
       // wrong - substitute the column learned from the uncollided rows of
       // the same exercise (see buildColumnRepairMap).
-      const repairedX = columnRepairs.get(`${verdict.answerIndex}:${verdict.field}`);
+      // Never for a true/false CORRECTION: it is written under the wrong
+      // word out in the sentence, not in a column, so its x legitimately
+      // differs from every other row's - "repairing" it pulled the mark
+      // into the Richtig column.
+      const isCorrectionVerdict = exerciseType === 'true_false_correction' && verdict.markAs === 'correction';
+      const repairedX = isCorrectionVerdict ? undefined : columnRepairs.get(`${verdict.answerIndex}:${posField}`);
       if (repairedX !== undefined) {
         x1 = repairedX;
         // A column repair supersedes the collapse handling: it gives an
@@ -893,7 +1014,7 @@ app.post('/annotate', async (req, res) => {
       // a single verdict for the whole merged row keeps its old position.
       const partCount = countParts(fieldValue(field));
       if (Number.isInteger(verdict.part) && partCount > 1 && verdict.part < partCount) {
-        const key = `${fieldValue(row && row.exerciseNumber)}|${verdict.field}|${partCount}`;
+        const key = `${fieldValue(row && row.exerciseNumber)}|${posField}|${partCount}`;
         const split = mergedSplits.get(key) || { x1: gradedBox[0], w: gradedBox[2] - gradedBox[0] };
         x1 = split.x1 + (split.w * verdict.part) / partCount;
         rightAlignMark = false;
@@ -969,7 +1090,7 @@ app.post('/annotate', async (req, res) => {
           // stack this mark on top of the frage mark. Start of its own
           // column on the correct row instead.
           const ownColumn = (!isTrueFalse && verdict.field !== 'frage')
-            ? fieldColumnStart(answers, fieldValue(row && row.exerciseNumber), verdict.field)
+            ? fieldColumnStart(answers, fieldValue(row && row.exerciseNumber), posField)
             : null;
           x1 = ownColumn !== null ? ownColumn : frageBox[0];
           y1 = rowAnchorY(frageBox, lineHeightNorm);
@@ -1062,15 +1183,61 @@ app.post('/annotate', async (req, res) => {
         // boundingBoxes are null, so it always won and the subtotal was
         // then dropped entirely, even though antwort/fall had perfectly
         // good coordinates sitting right there.
-        const anchorField = [row.frage, row.antwort, row.fall].find(hasTrustedBoxes);
-        if (!anchorField) continue;
+        // Prefer any row of the exercise with a position, not just the first.
+        let anchorField = [row.frage, row.antwort, row.fall].find(hasTrustedBoxes);
+        if (!anchorField) {
+          const other = answers.find(a => a && matchesExercise(a) && [a.frage, a.antwort, a.fall].some(hasTrustedBoxes));
+          if (other) anchorField = [other.frage, other.antwort, other.fall].find(hasTrustedBoxes);
+        }
 
-        const page = pages[anchorField.review.page - 1];
+        // No row of the exercise has a position at all (Aufgabe 3 on one
+        // paper: the whole text came back as a single unlocated row). Its
+        // subtotal - and the warning under it, which matters most exactly
+        // then - was silently dropped. Place it in the gap between the
+        // previous exercise's last located box and the next exercise's first,
+        // which is where the exercise sits on the page.
+        let anchorBox;
+        let anchorPage;
+        if (anchorField) {
+          anchorBox = anchorField.review.boundingBoxes[0];
+          anchorPage = anchorField.review.page;
+        } else {
+          const boxesOf = (a) => [a.frage, a.antwort, a.fall].filter(hasTrustedBoxes);
+          let prev = null;
+          for (let k = firstRowIndex - 1; k >= 0 && !prev; k--) {
+            const bs = answers[k] ? boxesOf(answers[k]) : [];
+            if (bs.length) prev = bs.reduce((lo, f) => (f.review.boundingBoxes[0][3] > lo.review.boundingBoxes[0][3] ? f : lo));
+          }
+          let next = null;
+          for (let k = firstRowIndex + 1; k < answers.length && !next; k++) {
+            if (!answers[k] || matchesExercise(answers[k])) continue;
+            const bs = boxesOf(answers[k]);
+            if (bs.length) next = bs.reduce((hi, f) => (f.review.boundingBoxes[0][1] < hi.review.boundingBoxes[0][1] ? f : hi));
+          }
+          if (prev && next && prev.review.page === next.review.page) {
+            // Just below the previous exercise - where this exercise's own
+            // heading is printed - but never past the next exercise.
+            anchorPage = prev.review.page;
+            const y = Math.min(prev.review.boundingBoxes[0][3] + 0.05, next.review.boundingBoxes[0][1] - 0.03);
+            anchorBox = [0, y, 0, y];
+          } else if (prev) {
+            anchorPage = prev.review.page;
+            const y = prev.review.boundingBoxes[0][3] + 0.04;
+            anchorBox = [0, y, 0, y];
+          } else if (next) {
+            anchorPage = next.review.page;
+            const y = Math.max(0, next.review.boundingBoxes[0][1] - 0.04);
+            anchorBox = [0, y, 0, y];
+          } else {
+            continue;
+          }
+        }
+
+        const page = pages[anchorPage - 1];
         if (!page) continue;
 
         const { width, height } = page.getSize();
         const rotationAngle = page.getRotation().angle;
-        const anchorBox = anchorField.review.boundingBoxes[0];
         const lineHeightNorm = SUBTOTAL_FONT_SIZE / ((rotationAngle === 90 || rotationAngle === 270) ? width : height);
 
         // Same compact form as the individual marks ("3.13/5P" rather than
