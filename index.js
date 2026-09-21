@@ -1419,7 +1419,8 @@ app.post('/annotate', async (req, res) => {
         // judgment and a "b" correction - so pool "5b" has real points but
         // no row of its own to sit beside. Anchor it to the exercise's rows
         // anyway, otherwise a whole sub-part's score silently never appears.
-        if (firstRowIndex === -1) {
+        const poolHasOwnRow = firstRowIndex !== -1;
+        if (!poolHasOwnRow) {
           firstRowIndex = answers.findIndex(matchesExercise);
         }
         if (firstRowIndex === -1) continue;
@@ -1444,13 +1445,54 @@ app.post('/annotate', async (req, res) => {
         // then - was silently dropped. Place it in the gap between the
         // previous exercise's last located box and the next exercise's first,
         // which is where the exercise sits on the page.
+        const boxesOf = (a) => [a.frage, a.antwort, a.fall].filter(hasTrustedBoxes);
+        const lowestOf = (bs) => bs.reduce((lo, f) => (f.review.boundingBoxes[0][3] > lo.review.boundingBoxes[0][3] ? f : lo));
+        const topmostOf = (bs) => bs.reduce((hi, f) => (f.review.boundingBoxes[0][1] < hi.review.boundingBoxes[0][1] ? f : hi));
+
         let anchorBox;
         let anchorPage;
-        if (anchorField) {
+
+        // A POOL WITH NO ROW OF ITS OWN must not borrow a sibling pool's row.
+        // A task left completely blank gives the extraction nothing, so pool
+        // "3a" falls back to "any row of exercise 3" - and on Kerim's paper
+        // that is 3b, which put 3a's zero at y 0.402, right beside 3b's answer
+        // and a whole task below where it belongs.
+        //
+        // The blank answer lines sit between the last located row BEFORE the
+        // exercise and the exercise's own first row, so the zero goes there:
+        // measured on Kerim, between 2d iii ending at 0.175 and 3b's question
+        // starting at 0.385.
+        if (!poolHasOwnRow) {
+          const exFirst = answers.findIndex(matchesExercise);
+          let next = null;
+          if (exFirst !== -1 && answers[exFirst]) {
+            const bs = boxesOf(answers[exFirst]);
+            if (bs.length) next = topmostOf(bs);
+          }
+          let prev = null;
+          for (let k = exFirst - 1; k >= 0 && !prev; k--) {
+            const bs = answers[k] ? boxesOf(answers[k]) : [];
+            if (bs.length) prev = lowestOf(bs);
+          }
+          if (next && prev && prev.review.page === next.review.page) {
+            anchorPage = next.review.page;
+            const y = Math.min(prev.review.boundingBoxes[0][3] + 0.05, next.review.boundingBoxes[0][1] - 0.03);
+            anchorBox = [0, y, 0, y];
+          } else if (next) {
+            // The previous row is on another page, so there is nothing to
+            // measure the gap from - sit just above the exercise's own start.
+            anchorPage = next.review.page;
+            const y = Math.max(0, next.review.boundingBoxes[0][1] - 0.06);
+            anchorBox = [0, y, 0, y];
+          }
+        }
+
+        if (anchorBox) {
+          // already placed by the blank-pool branch above
+        } else if (anchorField) {
           anchorBox = anchorField.review.boundingBoxes[0];
           anchorPage = anchorField.review.page;
         } else {
-          const boxesOf = (a) => [a.frage, a.antwort, a.fall].filter(hasTrustedBoxes);
           let prev = null;
           for (let k = firstRowIndex - 1; k >= 0 && !prev; k--) {
             const bs = answers[k] ? boxesOf(answers[k]) : [];
