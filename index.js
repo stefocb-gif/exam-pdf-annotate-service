@@ -842,7 +842,6 @@ app.post('/annotate', async (req, res) => {
         warnedPools.add(String(sub.key));
       }
     }
-    const manualCheckPools = [...warnedPools].sort();
 
     if (!pdfBase64 || !reviewData || !verdicts) {
       return res.status(400).json({
@@ -922,6 +921,38 @@ app.post('/annotate', async (req, res) => {
     ]);
     const judgmentColumns = buildJudgmentColumnMap(answers);
     const duplicateFrageRows = buildDuplicateFrageSet(answers);
+
+    // Which pools actually produced a verdict. Used to tell a pool that scored
+    // zero because the student left it BLANK from one that is doubtful - see
+    // the warned-pool block below. Same key construction as node 21.
+    const poolOf = (row, markAs) => {
+      const sp = fieldValue(row && row.subPart);
+      let ps = sp ? String(sp).trim().charAt(0) : '';
+      if (fieldValue(row && row.exerciseType) === 'true_false_correction') {
+        ps = markAs === 'correction' ? 'b' : 'a';
+      }
+      return String(fieldValue(row && row.exerciseNumber)) + ps;
+    };
+    const poolsWithVerdicts = new Set();
+    for (const v of verdicts) {
+      const r = answers[v.answerIndex];
+      if (r) poolsWithVerdicts.add(poolOf(r, v.markAs));
+    }
+
+    // A BLANK TASK IS NOT A DOUBT. Change 2 gives a pool with points but no
+    // verdicts a synthetic zero carrying "! keine Antwort erfasst" — and that
+    // is a settled result, not something the teacher has to recount: nothing
+    // was written, so nothing can be worth points. It stays blue and it does
+    // not hold back the grade.
+    //
+    // The test is structural rather than a match on the warning's wording: a
+    // pool that produced no verdict at all is exactly the case Change 2
+    // synthesises. A pool whose verdicts happen to sum to zero has verdicts,
+    // so it is not caught here.
+    for (const key of [...warnedPools]) {
+      if (!poolsWithVerdicts.has(key)) warnedPools.delete(key);
+    }
+    const manualCheckPools = [...warnedPools].sort();
 
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
@@ -1362,6 +1393,10 @@ app.post('/annotate', async (req, res) => {
     const subtotalsDrawnPerRow = {};
     if (Array.isArray(subtotals)) {
       for (const sub of subtotals) {
+        // Margin mode draws no subtotals except the ones carrying a warning -
+        // including a blank task's settled zero, which has no verdict and so
+        // no mark of its own. Without it, "nothing written" and "nothing to
+        // say" look identical on the page.
         if (MARGIN_MODE && !sub.warning) continue;
         // sub.key looks like "1a", "1b", or just "2" (no sub-part letter).
         const match = String(sub.key).match(/^(\d+)([a-zA-Z]?)$/);
@@ -1513,7 +1548,9 @@ app.post('/annotate', async (req, res) => {
         //
         // The text of the warning stays in the execution output and in
         // positionWarnings; only the drawing of it stops.
-        const subtotalColor = sub.warning ? rgb(0.85, 0.45, 0) : rgb(0, 0, 0.6);
+        // Amber only where the teacher has to look. A blank task carries a
+        // warning too, but it is a settled zero — it stays blue.
+        const subtotalColor = warnedPools.has(String(sub.key)) ? rgb(0.85, 0.45, 0) : rgb(0, 0, 0.6);
         drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, subtotalColor, rotationAngle, labelFontBold);
       }
     }
