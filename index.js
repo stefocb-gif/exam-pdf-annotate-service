@@ -56,6 +56,11 @@ const SUBTOTAL_LEFT_INSET = 2;
 // Where the margin-mode mark sits, as a fraction of page width. Carried over
 // unchanged from the Hoerverstehen build so that template keeps its exact
 // current appearance.
+// Where the 'check this yourself' note sits: above every header field the
+// schema reports. The highest is the student's name, at y 0.116 on both exam
+// types, so 0.045 clears it with room to spare.
+const NOTE_TOP_Y = 0.045;
+
 const RIGHT_MARGIN_X_FRACTION = 0.94;
 
 // Exam PDFs with images can be large - raise the body size limit.
@@ -824,19 +829,20 @@ app.post('/annotate', async (req, res) => {
     // be arithmetic over an exercise that still needs counting. An amber note
     // names the exercises instead.
     //
-    // Whole exercise, not the individual pool: 5a and 5b sit under one printed
-    // heading, so marks in one and none in the other would read as an error in
-    // the annotation rather than as a request to check. It is also the
-    // conservative direction — fewer marks drawn is less to wrongly trust.
-    const warnedExercises = new Set();
+    // PER POOL, not per exercise. 5a and 5b sit under one printed heading but
+    // are separate point pools, and the teacher's instruction (21.09.2026) is
+    // that when only one of them is doubtful she wants BOTH pool subtotals on
+    // the page and no combined exercise figure — so she can add them up
+    // herself. Suppressing the whole exercise would take the sound half away
+    // with the doubtful one.
+    const warnedPools = new Set();
     if (Array.isArray(subtotals)) {
       for (const sub of subtotals) {
         if (!sub || !sub.warning) continue;
-        const m = String(sub.key).match(/^(\d+)/);
-        if (m) warnedExercises.add(m[1]);
+        warnedPools.add(String(sub.key));
       }
     }
-    const manualCheckExercises = [...warnedExercises].sort((a, b) => Number(a) - Number(b));
+    const manualCheckPools = [...warnedPools].sort();
 
     if (!pdfBase64 || !reviewData || !verdicts) {
       return res.status(400).json({
@@ -920,12 +926,6 @@ app.post('/annotate', async (req, res) => {
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
 
-      // Flagged exercise: draw nothing in it, whatever the confidence.
-      const rowExercise = String(fieldValue(row && row.exerciseNumber));
-      if (warnedExercises.has(rowExercise)) {
-        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (Aufgabe ${rowExercise} is flagged for manual checking - no marks are drawn in it)`);
-        continue;
-      }
 
       // ANCHOR POLICY for exercise types where the graded field's text can
       // legitimately repeat across rows (true_false_correction's antwort
@@ -947,6 +947,20 @@ app.post('/annotate', async (req, res) => {
       // if the graded field has no coordinates at all.
       const exerciseType = fieldValue(row && row.exerciseType);
       const subPart = fieldValue(row && row.subPart);
+
+      // Flagged pool: draw nothing in it, whatever the confidence. The pool key
+      // is built exactly as node 21 builds it - the sub-part's FIRST character,
+      // so "2d i" pools as "2d" - and true_false_correction splits one row into
+      // an "a" judgment and a "b" correction via markAs rather than subPart.
+      let poolSub = subPart ? String(subPart).trim().charAt(0) : '';
+      if (exerciseType === 'true_false_correction') {
+        poolSub = verdict.markAs === 'correction' ? 'b' : 'a';
+      }
+      const poolKey = String(fieldValue(row && row.exerciseNumber)) + poolSub;
+      if (warnedPools.has(poolKey)) {
+        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (Aufgabe ${poolKey} is flagged for manual checking - no marks are drawn in it)`);
+        continue;
+      }
 
       // In case_identification antwort and fall hold the same answer, and
       // which of the two DocuPipe fills varies from paper to paper - one
@@ -1611,18 +1625,26 @@ app.post('/annotate', async (req, res) => {
       // something that still has to be counted, so neither is drawn. The note
       // takes the grade's place: right-aligned at the margin, where it grows
       // leftward across the empty half of the header instead of off the page.
-      if (manualCheckExercises.length) {
-        // A flagged exercise means the total and the grade would be arithmetic
-        // over something that still has to be counted, so NEITHER is drawn.
-        // The note takes the grade's place: right-aligned at the margin, where
-        // it grows leftward across the empty half of the header instead of off
-        // the page edge.
-        const noteText = `keine Note - Aufgabe${manualCheckExercises.length > 1 ? 'n' : ''} ${manualCheckExercises.join(', ')} manuell prüfen`;
-        if (!drawInMargin(headerRowField, noteText, SUBTOTAL_FONT_SIZE, rgb(0.85, 0.45, 0))) {
-          const lastPage = pages[pages.length - 1];
-          const rot = lastPage.getRotation().angle;
-          const p = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), rot);
-          drawLabel(lastPage, noteText, p.x, p.y, SUBTOTAL_FONT_SIZE, rgb(0.85, 0.45, 0), rot, labelFontBold);
+      if (manualCheckPools.length) {
+        // A flagged pool means the total and the grade would be arithmetic over
+        // something that still has to be counted, so NEITHER is drawn.
+        //
+        // The note sits ABOVE the header rather than in it. Put on the score's
+        // own row it covered the printed "Punkte:" and "Note:" labels it is
+        // there to explain; at NOTE_TOP_Y it clears every field the schema
+        // reports (the highest is the student's name at y 0.116 on both exam
+        // types). Right-aligned at the margin, like the grade it replaces.
+        const noteText = `Aufgabe${manualCheckPools.length > 1 ? 'n' : ''} ${manualCheckPools.join(', ')} manuell prüfen`;
+        const page = pages[0];
+        if (page) {
+          const { width, height } = page.getSize();
+          const rotationAngle = page.getRotation().angle;
+          let { x, y } = toRawCoords(RIGHT_MARGIN_X_FRACTION, NOTE_TOP_Y, width, height, rotationAngle);
+          const w = labelFontBold.widthOfTextAtSize(noteText, SUBTOTAL_FONT_SIZE);
+          const rad = (rotationAngle * Math.PI) / 180;
+          x -= w * Math.cos(rad);
+          y -= w * Math.sin(rad);
+          drawLabel(page, noteText, x, y, SUBTOTAL_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold);
         }
       } else {
         const punkteDrawn = drawAtField(punkteField, scoreText, 0);
@@ -1663,9 +1685,9 @@ app.post('/annotate', async (req, res) => {
       skipped,
       positionWarnings,
       pdfPageCount: pages.length,
-      // Exercises left unmarked on purpose, for the workflow to surface.
+      // Point pools left unmarked on purpose, for the workflow to surface.
       // Non-empty means no total and no grade were drawn either.
-      manualCheckExercises
+      manualCheckPools
     });
 
   } catch (err) {
