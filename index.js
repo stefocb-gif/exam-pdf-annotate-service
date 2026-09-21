@@ -811,6 +811,33 @@ app.post('/annotate', async (req, res) => {
     // type gets the safe behaviour rather than a repair layer tuned elsewhere.
     const MARGIN_MODE = String(examType || '').trim().toLowerCase() !== 'grammatik';
 
+    // EXERCISES THE TEACHER HAS TO COUNT HERSELF.
+    //
+    // A subtotal carrying a warning means something in that exercise was not
+    // graded or could not be located. From 21.09.2026 the paper says so by
+    // leaving the exercise ALONE: no marks are drawn in it at all — not even
+    // the ones with good coordinates — and only its subtotal appears, in
+    // amber. A half-marked exercise is worse than an unmarked one, because it
+    // invites the reader to trust the half that is there.
+    //
+    // The header loses its total and its grade for the same reason: both would
+    // be arithmetic over an exercise that still needs counting. An amber note
+    // names the exercises instead.
+    //
+    // Whole exercise, not the individual pool: 5a and 5b sit under one printed
+    // heading, so marks in one and none in the other would read as an error in
+    // the annotation rather than as a request to check. It is also the
+    // conservative direction — fewer marks drawn is less to wrongly trust.
+    const warnedExercises = new Set();
+    if (Array.isArray(subtotals)) {
+      for (const sub of subtotals) {
+        if (!sub || !sub.warning) continue;
+        const m = String(sub.key).match(/^(\d+)/);
+        if (m) warnedExercises.add(m[1]);
+      }
+    }
+    const manualCheckExercises = [...warnedExercises].sort((a, b) => Number(a) - Number(b));
+
     if (!pdfBase64 || !reviewData || !verdicts) {
       return res.status(400).json({
         error: 'Missing required field(s): pdfBase64, reviewData, verdicts are all required.'
@@ -892,6 +919,13 @@ app.post('/annotate', async (req, res) => {
 
     for (const verdict of verdicts) {
       const row = answers[verdict.answerIndex];
+
+      // Flagged exercise: draw nothing in it, whatever the confidence.
+      const rowExercise = String(fieldValue(row && row.exerciseNumber));
+      if (warnedExercises.has(rowExercise)) {
+        skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (Aufgabe ${rowExercise} is flagged for manual checking - no marks are drawn in it)`);
+        continue;
+      }
 
       // ANCHOR POLICY for exercise types where the graded field's text can
       // legitimately repeat across rows (true_false_correction's antwort
@@ -1307,9 +1341,14 @@ app.post('/annotate', async (req, res) => {
     //
     // The workflow still COMPUTES them - 19merge and node 21 are untouched, so
     // they stay in the execution output. Only the drawing stops.
+    // Margin mode draws no subtotals — except a flagged one, which is the only
+    // thing left on that exercise once its marks are suppressed. Without it a
+    // Hoerverstehen paper would show an exercise with nothing at all on it and
+    // no way to tell that from "nothing to say".
     const subtotalsDrawnPerRow = {};
-    if (!MARGIN_MODE && Array.isArray(subtotals)) {
+    if (Array.isArray(subtotals)) {
       for (const sub of subtotals) {
+        if (MARGIN_MODE && !sub.warning) continue;
         // sub.key looks like "1a", "1b", or just "2" (no sub-part letter).
         const match = String(sub.key).match(/^(\d+)([a-zA-Z]?)$/);
         if (!match) continue;
@@ -1421,10 +1460,22 @@ app.post('/annotate', async (req, res) => {
         // in points and converted through the usual transform, so it stays
         // at the visual left edge on a rotated page too.
         const anchorY = rowAnchorY(anchorBox, lineHeightNorm);
-        const insetNorm = SUBTOTAL_LEFT_INSET / ((rotationAngle === 90 || rotationAngle === 270) ? height : width);
-        const pos = toRawCoords(insetNorm, anchorY, width, height, rotationAngle);
+        const sideways = rotationAngle === 90 || rotationAngle === 270;
+        const visualW = sideways ? height : width;
+        // In margin mode the flagged subtotal goes where that template's marks
+        // go — the right margin — rather than reintroducing a left-hand column
+        // the Hoerverstehen paper has never had.
+        const xNorm = MARGIN_MODE ? RIGHT_MARGIN_X_FRACTION : (SUBTOTAL_LEFT_INSET / visualW);
+        const pos = toRawCoords(xNorm, anchorY, width, height, rotationAngle);
         let subX = pos.x;
         let subY = pos.y;
+        if (MARGIN_MODE) {
+          // right-aligned, so the label ends at the margin
+          const w = labelFontBold.widthOfTextAtSize(subtotalText, SUBTOTAL_FONT_SIZE);
+          const rad = (rotationAngle * Math.PI) / 180;
+          subX -= w * Math.cos(rad);
+          subY -= w * Math.sin(rad);
+        }
 
         // Two sub-parts can now share one anchor row (see the fallback
         // above), which would stack "2.5P / 3P" and "3P / 3P" on the exact
@@ -1522,8 +1573,6 @@ app.post('/annotate', async (req, res) => {
         return true;
       }
 
-      const punkteDrawn = drawAtField(punkteField, scoreText, 0);
-
       // THE GRADE GOES IN THE RIGHT MARGIN, on the score's row, on every exam
       // type - and it is the largest thing on the page, because it is the one
       // number the student looks for.
@@ -1538,7 +1587,7 @@ app.post('/annotate', async (req, res) => {
       //
       // Right-aligned, so the label ENDS at the margin rather than running off
       // the page edge.
-      function drawGradeInMargin(field, text) {
+      function drawInMargin(field, text, size, color) {
         if (!text) return false;
         if (!hasTrustedBoxes(field)) return false;
         const page = pages[field.review.page - 1];
@@ -1548,40 +1597,61 @@ app.post('/annotate', async (req, res) => {
         const [, y1, , y2] = field.review.boundingBoxes[0];
         const sideways = rotationAngle === 90 || rotationAngle === 270;
         const visualH = sideways ? width : height;
-        const baselineNorm = (y1 + y2) / 2 + (0.35 * GRADE_FONT_SIZE) / visualH;
+        const baselineNorm = (y1 + y2) / 2 + (0.35 * size) / visualH;
         let { x, y } = toRawCoords(RIGHT_MARGIN_X_FRACTION, baselineNorm, width, height, rotationAngle);
-        const w = labelFontBold.widthOfTextAtSize(text, GRADE_FONT_SIZE);
+        const w = labelFontBold.widthOfTextAtSize(text, size);
         const rad = (rotationAngle * Math.PI) / 180;
         x -= w * Math.cos(rad);
         y -= w * Math.sin(rad);
-        drawLabel(page, text, x, y, GRADE_FONT_SIZE, rgb(0, 0, 0.7), rotationAngle, labelFontBold);
+        drawLabel(page, text, x, y, size, color, rotationAngle, labelFontBold);
         return true;
       }
-      const noteDrawn = drawGradeInMargin(headerRowField, gradeText);
 
-      // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
-      // OCR'd content yet, so Review may not report coordinates for them.
-      // Try anchoring near known-good fields instead (maxScore/expectedGrade
-      // DO have real values already, so they likely have real coordinates).
-      // Nudge down slightly (-8) since these anchor fields' own boxes likely
-      // represent the TOP of their text, while drawText positions by
-      // baseline - using the raw coordinate directly renders noticeably
-      // higher than the original text visually sat.
-      let anchorFallbackUsed = false;
-      if (!punkteDrawn) {
-        // Carry the grade here only if the margin placement found no row at
-        // all - otherwise one number in the header is better than none.
-        const text = (!noteDrawn && gradeText) ? `${scoreText}   Note ${gradeText}  ` : scoreText + '  ';
-        anchorFallbackUsed = drawAtField(maxScoreField, text, -8);
-      }
+      // A flagged exercise means the total and the grade are arithmetic over
+      // something that still has to be counted, so neither is drawn. The note
+      // takes the grade's place: right-aligned at the margin, where it grows
+      // leftward across the empty half of the header instead of off the page.
+      if (manualCheckExercises.length) {
+        // A flagged exercise means the total and the grade would be arithmetic
+        // over something that still has to be counted, so NEITHER is drawn.
+        // The note takes the grade's place: right-aligned at the margin, where
+        // it grows leftward across the empty half of the header instead of off
+        // the page edge.
+        const noteText = `keine Note - Aufgabe${manualCheckExercises.length > 1 ? 'n' : ''} ${manualCheckExercises.join(', ')} manuell prüfen`;
+        if (!drawInMargin(headerRowField, noteText, SUBTOTAL_FONT_SIZE, rgb(0.85, 0.45, 0))) {
+          const lastPage = pages[pages.length - 1];
+          const rot = lastPage.getRotation().angle;
+          const p = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), rot);
+          drawLabel(lastPage, noteText, p.x, p.y, SUBTOTAL_FONT_SIZE, rgb(0.85, 0.45, 0), rot, labelFontBold);
+        }
+      } else {
+        const punkteDrawn = drawAtField(punkteField, scoreText, 0);
+        const noteDrawn = drawInMargin(headerRowField, gradeText, GRADE_FONT_SIZE, rgb(0, 0, 0.7));
 
-      // Fallback tier 3 (last resort): corner of the last page, so the
-      // total is never silently lost even if no anchor fields exist.
-      if (!punkteDrawn && !noteDrawn && !anchorFallbackUsed) {
-        const lastPage = pages[pages.length - 1];
-        const lastPageRotation = lastPage.getRotation().angle;
-        const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
-        drawLabel(lastPage, `Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, x, y, HEADER_FONT_SIZE, rgb(0, 0, 0), lastPageRotation, labelFontBold);
+        // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
+        // OCR'd content yet, so Review may not report coordinates for them.
+        // Try anchoring near known-good fields instead (maxScore/expectedGrade
+        // DO have real values already, so they likely have real coordinates).
+        // Nudge down slightly (-8) since these anchor fields' own boxes likely
+        // represent the TOP of their text, while drawText positions by
+        // baseline - using the raw coordinate directly renders noticeably
+        // higher than the original text visually sat.
+        let anchorFallbackUsed = false;
+        if (!punkteDrawn) {
+          // Carry the grade here only if the margin placement found no row at
+          // all - otherwise one number in the header is better than none.
+          const text = (!noteDrawn && gradeText) ? `${scoreText}   Note ${gradeText}  ` : scoreText + '  ';
+          anchorFallbackUsed = drawAtField(maxScoreField, text, -8);
+        }
+
+        // Fallback tier 3 (last resort): corner of the last page, so the
+        // total is never silently lost even if no anchor fields exist.
+        if (!punkteDrawn && !noteDrawn && !anchorFallbackUsed) {
+          const lastPage = pages[pages.length - 1];
+          const lastPageRotation = lastPage.getRotation().angle;
+          const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
+          drawLabel(lastPage, `Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, x, y, HEADER_FONT_SIZE, rgb(0, 0, 0), lastPageRotation, labelFontBold);
+        }
       }
     }
 
@@ -1592,7 +1662,10 @@ app.post('/annotate', async (req, res) => {
       annotatedCount,
       skipped,
       positionWarnings,
-      pdfPageCount: pages.length
+      pdfPageCount: pages.length,
+      // Exercises left unmarked on purpose, for the workflow to surface.
+      // Non-empty means no total and no grade were drawn either.
+      manualCheckExercises
     });
 
   } catch (err) {
