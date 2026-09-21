@@ -35,9 +35,14 @@ const MARGIN_MARK_FONT_SIZE = MARK_FONT_SIZE + 1;
 // summary line rather than as just another per-answer mark.
 const SUBTOTAL_FONT_SIZE = 12;
 
-// The header total and final grade are drawn bold and slightly larger than
-// the subtotals, so the two headline numbers stand out at the top of page 1.
+// The header total is drawn bold and slightly larger than the subtotals, so
+// it stands out at the top of page 1.
 const HEADER_FONT_SIZE = 14;
+
+// The grade is the one number the student looks for first, and it sits alone
+// in the right margin with nothing around it - so it is the largest thing on
+// the page. Enlarged at the teacher's request, 21.09.2026.
+const GRADE_FONT_SIZE = 20;
 
 // Row-count warnings sit under their subtotal and must not compete with it
 // for attention, so they are drawn smaller.
@@ -1472,16 +1477,13 @@ app.post('/annotate', async (req, res) => {
       // 'pointsAchieved' and 'pointsMax' were in neither list, which is why
       // the Grammatik header showed a grade and no score at all.
       const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.pointsAchieved || reviewData.Punkte || reviewData.punkte;
-      const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
-      const gradeAnchorField = reviewData.expectedGrade || reviewData.grade;
+      const maxScoreField = reviewData.maxScore || reviewData.maxPoints || reviewData.pointsMax;
 
-      // Can the grade be placed at all? On Hoerverstehen 'grade' comes back
-      // blank AND boxless, and so does the expectedGrade anchor, so the grade
-      // had nowhere to go and was dropped without a word. When that happens it
-      // rides on the score label instead - one number in the header is better
-      // than the wrong one.
-      const gradeHasAnchor = hasTrustedBoxes(noteField) || hasTrustedBoxes(gradeAnchorField);
-      const scoreLabel = (gradeText && !gradeHasAnchor) ? `${scoreText}   Note ${gradeText}` : scoreText;
+      // The score's own row, used to put the grade on the same line. Either
+      // field will do - they sit side by side in the header - so take whichever
+      // has a trustworthy box.
+      const headerRowField = hasTrustedBoxes(punkteField) ? punkteField
+                           : (hasTrustedBoxes(maxScoreField) ? maxScoreField : null);
 
       // Returning false on an untrustworthy coordinate is what makes the
       // fallback tiers below actually work. This guards against the exact
@@ -1502,28 +1504,42 @@ app.post('/annotate', async (req, res) => {
         return true;
       }
 
-      const punkteDrawn = drawAtField(punkteField, scoreLabel, 0);
-      // The grade goes BESIDE the handwritten grade, vertically centred on it.
-      // The Note cell holds the teacher's own grade (often circled), and its
-      // box top sits right under the Punkte row - drawing from that top edge
-      // put "4.0" over "/ 43 P" once the grade was set at 14pt.
-      function drawBesideField(field, text) {
+      const punkteDrawn = drawAtField(punkteField, scoreText, 0);
+
+      // THE GRADE GOES IN THE RIGHT MARGIN, on the score's row, on every exam
+      // type - and it is the largest thing on the page, because it is the one
+      // number the student looks for.
+      //
+      // It used to be drawn beside whichever field the schema calls the final
+      // grade. On the Kurztest that box sits at x 0.517 and the mark landed at
+      // ~0.571, right next to "Erwartete Note" at 0.579 - the student's OWN
+      // self-assessment, which has nothing to do with our grade. Anchoring to
+      // a schema field means inheriting whatever the form happens to label
+      // there; the right margin is ours, is unambiguous, and is where the
+      // Hoerverstehen marks already live.
+      //
+      // Right-aligned, so the label ENDS at the margin rather than running off
+      // the page edge.
+      function drawGradeInMargin(field, text) {
+        if (!text) return false;
         if (!hasTrustedBoxes(field)) return false;
         const page = pages[field.review.page - 1];
         if (!page) return false;
         const { width, height } = page.getSize();
         const rotationAngle = page.getRotation().angle;
-        const [, y1, x2, y2] = field.review.boundingBoxes[0];
+        const [, y1, , y2] = field.review.boundingBoxes[0];
         const sideways = rotationAngle === 90 || rotationAngle === 270;
-        const visualW = sideways ? height : width;
         const visualH = sideways ? width : height;
-        const gapNorm = 6 / visualW;
-        const baselineNorm = (y1 + y2) / 2 + (0.35 * HEADER_FONT_SIZE) / visualH;
-        const { x, y } = toRawCoords(x2 + gapNorm, baselineNorm, width, height, rotationAngle);
-        drawLabel(page, text, x, y, HEADER_FONT_SIZE, rgb(0, 0, 0.7), rotationAngle, labelFontBold);
+        const baselineNorm = (y1 + y2) / 2 + (0.35 * GRADE_FONT_SIZE) / visualH;
+        let { x, y } = toRawCoords(RIGHT_MARGIN_X_FRACTION, baselineNorm, width, height, rotationAngle);
+        const w = labelFontBold.widthOfTextAtSize(text, GRADE_FONT_SIZE);
+        const rad = (rotationAngle * Math.PI) / 180;
+        x -= w * Math.cos(rad);
+        y -= w * Math.sin(rad);
+        drawLabel(page, text, x, y, GRADE_FONT_SIZE, rgb(0, 0, 0.7), rotationAngle, labelFontBold);
         return true;
       }
-      const noteDrawn = drawBesideField(noteField, gradeText);
+      const noteDrawn = drawGradeInMargin(headerRowField, gradeText);
 
       // Fallback tier 2: blank fields (totalScore/finalGrade) often have no
       // OCR'd content yet, so Review may not report coordinates for them.
@@ -1535,11 +1551,10 @@ app.post('/annotate', async (req, res) => {
       // higher than the original text visually sat.
       let anchorFallbackUsed = false;
       if (!punkteDrawn) {
-        const maxScoreField = reviewData.maxScore || reviewData.maxPoints || reviewData.pointsMax;
-        anchorFallbackUsed = drawAtField(maxScoreField, scoreLabel + '  ', -8);
-      }
-      if (!noteDrawn && gradeText) {
-        anchorFallbackUsed = drawAtField(gradeAnchorField, gradeText + '  ', -8) || anchorFallbackUsed;
+        // Carry the grade here only if the margin placement found no row at
+        // all - otherwise one number in the header is better than none.
+        const text = (!noteDrawn && gradeText) ? `${scoreText}   Note ${gradeText}  ` : scoreText + '  ';
+        anchorFallbackUsed = drawAtField(maxScoreField, text, -8);
       }
 
       // Fallback tier 3 (last resort): corner of the last page, so the
