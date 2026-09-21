@@ -26,6 +26,11 @@ const app = express();
 // and the actual drawText call can never drift apart.
 const MARK_FONT_SIZE = 10;
 
+// Margin-mode marks are the only thing in the right margin and carry the row
+// on their own, so they are one point larger and bold. Grammatik marks sit on
+// the handwriting they judge and stay at MARK_FONT_SIZE.
+const MARGIN_MARK_FONT_SIZE = MARK_FONT_SIZE + 1;
+
 // Per-exercise subtotals are drawn larger and bold so they read as a
 // summary line rather than as just another per-answer mark.
 const SUBTOTAL_FONT_SIZE = 12;
@@ -815,6 +820,16 @@ app.post('/annotate', async (req, res) => {
     const labelFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
     const labelFontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
+    // In margin mode the mark stands alone in the right margin, with no
+    // handwriting under it and nothing beside it to anchor the eye - it has to
+    // carry its row by itself. One point larger and bold, at the teacher's
+    // request after reading the first annotated Hoerverstehen paper
+    // (21.09.2026). On Grammatik the mark sits ON the item, where bigger and
+    // bolder would compete with the handwriting it is judging, so it is left
+    // as it was.
+    const markFontSize = MARGIN_MODE ? MARGIN_MARK_FONT_SIZE : MARK_FONT_SIZE;
+    const markFont = MARGIN_MODE ? labelFontBold : labelFont;
+
     // Draws a score with a highlight behind it. Marks sit directly on top of
     // the student's handwriting, so green or red text alone can be hard to
     // pick out against dense blue ink. A near-opaque white pad knocks the
@@ -919,9 +934,20 @@ app.post('/annotate', async (req, res) => {
       // Falls through untouched when the row has no studentAnswer box: the
       // older schemas have no such field at all, and a "Richtig" row carries
       // no correction. In both cases the mark stays exactly where it was.
-      if (exerciseType === 'true_false_correction' && verdict.markAs === 'correction' &&
-          row && hasBoxes(row.studentAnswer)) {
-        posField = 'studentAnswer';
+      // Where the student wrote NO correction there is no box to move to, and
+      // the verdict falls back to the judgment's box - landing on top of the
+      // judgment mark. Measured on Kurztest A4 row 5: judgment at 0.772 (the
+      // learned Richtig column), correction at 0.764, about 4.8pt apart, just
+      // outside the 4px collision nudge below. The verdict is real - "keine
+      // Korrektur angegeben" costs the point - so it is placed one line under
+      // the judgment rather than hidden or left overlapping it.
+      let correctionWithoutOwnBox = false;
+      if (exerciseType === 'true_false_correction' && verdict.markAs === 'correction') {
+        if (row && hasBoxes(row.studentAnswer)) {
+          posField = 'studentAnswer';
+        } else {
+          correctionWithoutOwnBox = true;
+        }
       }
 
       const useHybridAnchor =
@@ -1159,6 +1185,14 @@ app.post('/annotate', async (req, res) => {
         rightAlignMark = true;   // the label must END at the margin, not start there
       }
 
+      // Normalized y grows downward, so adding a line-height moves the mark
+      // below the judgment it belongs to. Applied after every repair and after
+      // MARGIN_MODE, because it is a stacking decision, not a position repair.
+      if (correctionWithoutOwnBox) {
+        y1 += lineHeightNorm;
+        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - no correction was written, so this verdict has no box of its own; drawn one line under the judgment mark`);
+      }
+
       let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
 
       // LAST-RESORT safety net: if this mark would land essentially on top
@@ -1191,13 +1225,13 @@ app.post('/annotate', async (req, res) => {
       // than start there. The shift follows the text direction, so it stays
       // correct on a rotated page.
       if (rightAlignMark) {
-        const w = labelFont.widthOfTextAtSize(pointsLabel, MARK_FONT_SIZE);
+        const w = markFont.widthOfTextAtSize(pointsLabel, markFontSize);
         const rad = (rotationAngle * Math.PI) / 180;
         xPos -= w * Math.cos(rad);
         yTop -= w * Math.sin(rad);
       }
 
-      drawLabel(page, pointsLabel, xPos, yTop, MARK_FONT_SIZE, color, rotationAngle);
+      drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont);
 
 
       annotatedCount++;
@@ -1207,8 +1241,19 @@ app.post('/annotate', async (req, res) => {
     // of that sub-part, approximating "next to the exercise/sub-part title"
     // since we don't have a dedicated title-coordinate field - the first
     // matching answer row is the closest reliable anchor we have.
+    //
+    // GRAMMATIK ONLY. Subtotals are drawn at SUBTOTAL_LEFT_INSET - the LEFT
+    // page edge - while margin mode puts every per-row mark at the RIGHT edge.
+    // On Hoerverstehen that produced two competing columns of numbers on
+    // opposite sides of the same page, which is how it was reported from the
+    // first annotated paper (21.09.2026). The Hoerverstehen template never drew
+    // subtotals; the merge gave it the grammar build's subtotal block along
+    // with everything else, and this is that half being switched back off.
+    //
+    // The workflow still COMPUTES them - 19merge and node 21 are untouched, so
+    // they stay in the execution output. Only the drawing stops.
     const subtotalsDrawnPerRow = {};
-    if (Array.isArray(subtotals)) {
+    if (!MARGIN_MODE && Array.isArray(subtotals)) {
       for (const sub of subtotals) {
         // sub.key looks like "1a", "1b", or just "2" (no sub-part letter).
         const match = String(sub.key).match(/^(\d+)([a-zA-Z]?)$/);
