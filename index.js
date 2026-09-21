@@ -1094,6 +1094,17 @@ app.post('/annotate', async (req, res) => {
       const isTrueFalse = exerciseType === 'true_false_correction';
       const isCorrectionMark = isTrueFalse && verdict.markAs === 'correction';
 
+      // A correction verdict with no box of its own goes in the row's EMPTY
+      // judgment cell: the student ticked one of Richtig/Falsch, so the other
+      // is free by definition, it is on the correct row, and it is where the
+      // missing correction would have been written.
+      //
+      // The first attempt pushed the mark one line DOWN instead, and measuring
+      // it showed why that was wrong: the row pitch on A4 is 32.9pt and a line
+      // is 18.1pt, so the mark ended up closer to the NEXT row's judgment
+      // (15.6pt) than to its own (18.8pt) - it had simply moved the collision
+      // rather than resolved it.
+      let correctionPlacedInEmptyCell = false;
       if (isTrueFalse && !isCorrectionMark) {
         const cols = judgmentColumns.get(String(fieldValue(row && row.exerciseNumber)));
         if (cols && cols.size) {
@@ -1110,14 +1121,33 @@ app.post('/annotate', async (req, res) => {
             positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the "${word}" column never appears boxed on this paper; judgment mark placed in the observed judgment column instead`);
           }
         }
+      } else if (isTrueFalse && correctionWithoutOwnBox) {
+        const cols = judgmentColumns.get(String(fieldValue(row && row.exerciseNumber)));
+        if (cols && cols.size > 1) {
+          // 'field' is the judgment here - the correction has no field of its
+          // own - so its text says which cell the student ticked.
+          const ticked = /^\s*falsch/i.test(String(fieldValue(field) || '')) ? 'falsch' : 'richtig';
+          const empty = ticked === 'falsch' ? 'richtig' : 'falsch';
+          if (cols.has(empty)) {
+            x1 = cols.get(empty);
+            rightAlignMark = false;
+            correctionPlacedInEmptyCell = true;
+          }
+        }
       }
 
       // Only borrow frage's row position if frage itself is trustworthy -
       // the same confidence rule applied to the graded field above. A
       // low-confidence frage box is exactly as likely to be in the wrong
       // place as the duplicate-text coordinate it's meant to replace.
+      //
+      // A correction with no box of its own is the exception among correction
+      // marks: it is being placed against the judgment's row, so it wants the
+      // judgment's row anchor too. Without this it sat 8pt off its own
+      // judgment, because one took the row from frage and the other from
+      // richtigFalsch's box.
       if (useHybridAnchor &&
-          !isCorrectionMark &&
+          (!isCorrectionMark || correctionWithoutOwnBox) &&
           !duplicateFrageRows.has(verdict.answerIndex) &&
           hasTrustedBoxes(frageField) &&
           frageField.review.page === field.review.page) {
@@ -1185,12 +1215,16 @@ app.post('/annotate', async (req, res) => {
         rightAlignMark = true;   // the label must END at the margin, not start there
       }
 
-      // Normalized y grows downward, so adding a line-height moves the mark
-      // below the judgment it belongs to. Applied after every repair and after
-      // MARGIN_MODE, because it is a stacking decision, not a position repair.
       if (correctionWithoutOwnBox) {
-        y1 += lineHeightNorm;
-        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - no correction was written, so this verdict has no box of its own; drawn one line under the judgment mark`);
+        if (correctionPlacedInEmptyCell) {
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - no correction was written, so this verdict has no box of its own; drawn in the row's empty Richtig/Falsch cell`);
+        } else {
+          // Only one judgment column was ever observed on this paper, so
+          // there is no empty cell to use. Fall back to a line below the
+          // judgment - crowded, but on the right row and visible.
+          y1 += lineHeightNorm;
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - no correction was written and only one judgment column is boxed on this paper; drawn one line under the judgment mark`);
+        }
       }
 
       let { x: xPos, y: yTop } = toRawCoords(x1, y1, width, height, rotationAngle);
@@ -1429,8 +1463,25 @@ app.post('/annotate', async (req, res) => {
       const scoreText = `${fmtPoints(totalPointsAwarded)}P / ${fmtPoints(totalPointsPossible)}P`;
       const gradeText = swissGrade !== null ? formatGrade(swissGrade) : ''; // decimals follow GRADE_STEP
 
-      const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.Punkte || reviewData.punkte;
+      // FIELD NAMES PER SCHEMA. Each schema names these differently, and a
+      // name missing from this list is not an error anywhere - the field is
+      // simply never found and that half of the header is silently not drawn.
+      // Measured 21.09.2026, one half missing on each exam type:
+      //   Hoerverstehen  totalPoints / maxPoints / grade
+      //   wAoDOCxk       pointsAchieved / pointsMax / expectedGrade / finalGrade
+      // 'pointsAchieved' and 'pointsMax' were in neither list, which is why
+      // the Grammatik header showed a grade and no score at all.
+      const punkteField = reviewData.totalScore || reviewData.totalPoints || reviewData.pointsAchieved || reviewData.Punkte || reviewData.punkte;
       const noteField = reviewData.finalGrade || reviewData.grade || reviewData.Note || reviewData.note;
+      const gradeAnchorField = reviewData.expectedGrade || reviewData.grade;
+
+      // Can the grade be placed at all? On Hoerverstehen 'grade' comes back
+      // blank AND boxless, and so does the expectedGrade anchor, so the grade
+      // had nowhere to go and was dropped without a word. When that happens it
+      // rides on the score label instead - one number in the header is better
+      // than the wrong one.
+      const gradeHasAnchor = hasTrustedBoxes(noteField) || hasTrustedBoxes(gradeAnchorField);
+      const scoreLabel = (gradeText && !gradeHasAnchor) ? `${scoreText}   Note ${gradeText}` : scoreText;
 
       // Returning false on an untrustworthy coordinate is what makes the
       // fallback tiers below actually work. This guards against the exact
@@ -1451,7 +1502,7 @@ app.post('/annotate', async (req, res) => {
         return true;
       }
 
-      const punkteDrawn = drawAtField(punkteField, scoreText, 0);
+      const punkteDrawn = drawAtField(punkteField, scoreLabel, 0);
       // The grade goes BESIDE the handwritten grade, vertically centred on it.
       // The Note cell holds the teacher's own grade (often circled), and its
       // box top sits right under the Punkte row - drawing from that top edge
@@ -1484,12 +1535,11 @@ app.post('/annotate', async (req, res) => {
       // higher than the original text visually sat.
       let anchorFallbackUsed = false;
       if (!punkteDrawn) {
-        const maxScoreField = reviewData.maxScore || reviewData.maxPoints;
-        anchorFallbackUsed = drawAtField(maxScoreField, scoreText + '  ', -8);
+        const maxScoreField = reviewData.maxScore || reviewData.maxPoints || reviewData.pointsMax;
+        anchorFallbackUsed = drawAtField(maxScoreField, scoreLabel + '  ', -8);
       }
-      if (!noteDrawn) {
-        const expectedGradeField = reviewData.expectedGrade || reviewData.grade;
-        anchorFallbackUsed = drawAtField(expectedGradeField, gradeText + '  ', -8) || anchorFallbackUsed;
+      if (!noteDrawn && gradeText) {
+        anchorFallbackUsed = drawAtField(gradeAnchorField, gradeText + '  ', -8) || anchorFallbackUsed;
       }
 
       // Fallback tier 3 (last resort): corner of the last page, so the
