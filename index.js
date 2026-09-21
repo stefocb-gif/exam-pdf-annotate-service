@@ -44,9 +44,11 @@ const HEADER_FONT_SIZE = 14;
 // the page. Enlarged at the teacher's request, 21.09.2026.
 const GRADE_FONT_SIZE = 20;
 
-// Row-count warnings sit under their subtotal and must not compete with it
-// for attention, so they are drawn smaller.
-const WARNING_FONT_SIZE = 8;
+// Unused since 21.09.2026: a row-count warning used to be drawn as a second,
+// smaller line under its subtotal. It now shows as the subtotal's own colour
+// instead - two numbers under one exercise read as two subtotals. Kept so the
+// history of the layout stays legible.
+// const WARNING_FONT_SIZE = 8;
 
 // Distance in points from the page's left edge at which subtotals are drawn.
 const SUBTOTAL_LEFT_INSET = 2;
@@ -1099,17 +1101,16 @@ app.post('/annotate', async (req, res) => {
       const isTrueFalse = exerciseType === 'true_false_correction';
       const isCorrectionMark = isTrueFalse && verdict.markAs === 'correction';
 
-      // A correction verdict with no box of its own goes in the row's EMPTY
-      // judgment cell: the student ticked one of Richtig/Falsch, so the other
-      // is free by definition, it is on the correct row, and it is where the
-      // missing correction would have been written.
+      // A correction verdict with no box of its own is placed just after the
+      // sentence, on the judgment's row - see the branch below for why not in
+      // the row's empty Richtig/Falsch cell.
       //
       // The first attempt pushed the mark one line DOWN instead, and measuring
       // it showed why that was wrong: the row pitch on A4 is 32.9pt and a line
       // is 18.1pt, so the mark ended up closer to the NEXT row's judgment
       // (15.6pt) than to its own (18.8pt) - it had simply moved the collision
       // rather than resolved it.
-      let correctionPlacedInEmptyCell = false;
+      let correctionPlacedBesideSentence = false;
       if (isTrueFalse && !isCorrectionMark) {
         const cols = judgmentColumns.get(String(fieldValue(row && row.exerciseNumber)));
         if (cols && cols.size) {
@@ -1127,16 +1128,31 @@ app.post('/annotate', async (req, res) => {
           }
         }
       } else if (isTrueFalse && correctionWithoutOwnBox) {
-        const cols = judgmentColumns.get(String(fieldValue(row && row.exerciseNumber)));
-        if (cols && cols.size > 1) {
-          // 'field' is the judgment here - the correction has no field of its
-          // own - so its text says which cell the student ticked.
-          const ticked = /^\s*falsch/i.test(String(fieldValue(field) || '')) ? 'falsch' : 'richtig';
-          const empty = ticked === 'falsch' ? 'richtig' : 'falsch';
-          if (cols.has(empty)) {
-            x1 = cols.get(empty);
+        // Just after the end of the sentence, in the band before the
+        // Richtig/Falsch columns. Measured on A4 row 5: the sentence ends at
+        // 0.569 and the first judgment column starts at 0.764, so there is a
+        // clear strip of its own - and it is where the eye already looks for
+        // corrections, because on the rows that DO carry one the mark sits out
+        // in the sentence.
+        //
+        // NOT in the row's empty judgment cell, which is where this went
+        // first: a number inside the Falsch box reads as a verdict ABOUT
+        // Falsch, and it sits nowhere near the other corrections.
+        const fb = hasTrustedBoxes(frageField) ? frageField.review.boundingBoxes[0] : null;
+        if (fb && fb.length >= 4) {
+          const sideways = rotationAngle === 90 || rotationAngle === 270;
+          const visualW = sideways ? height : width;
+          const cols = judgmentColumns.get(String(fieldValue(row && row.exerciseNumber)));
+          const firstCol = (cols && cols.size) ? Math.min(...cols.values()) : 1;
+          const candidate = fb[2] + 8 / visualW;
+          // A long sentence could push the mark into the judgment column, so
+          // only take the position if the strip is actually wide enough for
+          // the label. Otherwise fall through to the line below.
+          const labelNorm = (MARK_FONT_SIZE * 2.6) / visualW;
+          if (candidate + labelNorm < firstCol) {
+            x1 = candidate;
             rightAlignMark = false;
-            correctionPlacedInEmptyCell = true;
+            correctionPlacedBesideSentence = true;
           }
         }
       }
@@ -1221,8 +1237,8 @@ app.post('/annotate', async (req, res) => {
       }
 
       if (correctionWithoutOwnBox) {
-        if (correctionPlacedInEmptyCell) {
-          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - no correction was written, so this verdict has no box of its own; drawn in the row's empty Richtig/Falsch cell`);
+        if (correctionPlacedBesideSentence) {
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - no correction was written, so this verdict has no box of its own; drawn just after the sentence, in the strip before the judgment columns`);
         } else {
           // Only one judgment column was ever observed on this paper, so
           // there is no empty cell to use. Fall back to a line below the
@@ -1420,18 +1436,20 @@ app.post('/annotate', async (req, res) => {
           ({ x: subX, y: subY } = nudgeVisualDown(subX, subY, stackIndex * (SUBTOTAL_FONT_SIZE + 4), rotationAngle));
         }
 
-        drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, rgb(0, 0, 0.6), rotationAngle, labelFontBold);
-
-        // Row-count warning from node 21: the extraction returned fewer rows
-        // for this exercise than the reference has, which means some of the
-        // student's answers were never graded at all. That makes the score
-        // itself wrong rather than just the annotation, so it has to be
-        // visible on the page - a missing answer leaves no other trace.
-        // Amber rather than red, since it flags "check this", not "wrong".
-        if (sub.warning) {
-          const warnPos = nudgeVisualDown(subX, subY, SUBTOTAL_FONT_SIZE + 2, rotationAngle);
-          drawLabel(page, sub.warning, warnPos.x, warnPos.y, WARNING_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold);
-        }
+        // A warning used to be drawn as a second line under the subtotal, in
+        // amber. On the page that reads as TWO subtotals for one exercise -
+        // one blue, one amber - which is exactly the wrong signal.
+        //
+        // The warning is now carried by the subtotal's own COLOUR: amber
+        // instead of blue, and no second line. Amber rather than red, since it
+        // says "look at this yourself", not "wrong". The teacher's instruction,
+        // 21.09.2026: one number per exercise, and its colour tells her whether
+        // the exercise needs her own eyes.
+        //
+        // The text of the warning stays in the execution output and in
+        // positionWarnings; only the drawing of it stops.
+        const subtotalColor = sub.warning ? rgb(0.85, 0.45, 0) : rgb(0, 0, 0.6);
+        drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, subtotalColor, rotationAngle, labelFontBold);
       }
     }
 
