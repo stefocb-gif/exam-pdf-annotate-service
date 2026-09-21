@@ -903,6 +903,27 @@ app.post('/annotate', async (req, res) => {
         if (hasBoxes(row[other])) posField = other;
       }
 
+      // A true/false CORRECTION is a different thing on the page from the
+      // judgment it accompanies, and since wAoDOCxk the extraction says so:
+      // richtigFalsch is boxed on the Richtig/Falsch checkbox (0.849-0.891 on
+      // Kurztest A4) and studentAnswer on the correction word out in the
+      // sentence (0.274-0.371). Node 24a maps 'antwort' to the JUDGMENT,
+      // because that is what the judgment mark and buildJudgmentColumnMap both
+      // need - so the correction verdict is the one case that wants the other
+      // box, and it asks for it by name here.
+      //
+      // This is the workaround Nitai was asked to remove. He split the two
+      // fields precisely so each could be boxed on its own; reading them back
+      // apart is the whole point of the split.
+      //
+      // Falls through untouched when the row has no studentAnswer box: the
+      // older schemas have no such field at all, and a "Richtig" row carries
+      // no correction. In both cases the mark stays exactly where it was.
+      if (exerciseType === 'true_false_correction' && verdict.markAs === 'correction' &&
+          row && hasBoxes(row.studentAnswer)) {
+        posField = 'studentAnswer';
+      }
+
       const useHybridAnchor =
         (exerciseType === 'true_false_correction' && posField === 'antwort' && subPart !== 'b') ||
         (exerciseType === 'case_identification' && (posField === 'fall' || posField === 'antwort')) ||
