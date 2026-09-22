@@ -894,6 +894,10 @@ app.post('/annotate', async (req, res) => {
 
     let annotatedCount = 0;
     const skipped = [];
+    // Marks that were not placed the ordinary way - reported so the
+    // workflow can surface them rather than leaving them to be noticed.
+    const marginWithheld = [];   // Grammatik: value shown in the margin, not on the item
+    const rowRecovered = [];     // margin mode: row taken from the question box
     const positionWarnings = [];
     const lastMarkPosByPage = {};
 
@@ -1047,10 +1051,54 @@ app.post('/annotate', async (req, res) => {
 
       const frageField = row && row.frage;
 
+      // ---- Change 24, 22.09.2026 ---------------------------------------
+      // A mark that is not drawn leaves the page SILENT. The teacher cannot
+      // tell "the pipeline declined to place this" from "this question was
+      // never graded", and on Enea's Nachpruefung that happened to three
+      // consecutive answers - 2a, 2b and 2c - while the score counted all
+      // three. Measured across 319 marks on 22.09: 5 withheld this way.
+      //
+      // The rule being applied is Nitai's, and it is right: never draw on a
+      // "low" coordinate, because a confident-looking mark in the wrong
+      // place is worse than no mark. But it was written for a mark drawn ON
+      // the item, where a wrong box puts the score on the wrong word.
+      //
+      // IN MARGIN MODE THAT DANGER DOES NOT EXIST. The mark goes in the
+      // right margin at a fixed x; the box supplies only the ROW. So when
+      // the answer's box is untrustworthy but the QUESTION's box on the same
+      // line is not, the row is still known and the mark can be drawn. On
+      // all five withheld marks the question's box was high or medium.
+      //
+      // IN GRAMMATIK the danger is real, so the refusal stands - but the
+      // page no longer stays silent about it: the value is drawn in AMBER in
+      // the right margin, on the row the question gives. The margin is ours
+      // and unambiguous, and amber already means "look at this" everywhere
+      // else in this file. She sees the score and that its placement was not
+      // trusted, instead of seeing nothing.
+      const gradedField = row && row[posField];
+      const gradedUnusable = !hasBoxes(gradedField) || gradedField.review.confidence === 'low';
+      let rowFromQuestion = false;   // margin mode: row borrowed, mark drawn normally
+      let withheldToMargin = false;  // Grammatik: not placed on the item, shown in the margin
+
       // The graded field itself is "the" field: it's what the verdict is
       // about, so it decides confidence, page and rotation. The hybrid
       // anchor below only ever borrows frage's row position.
-      const field = row && row[posField];
+      let field = gradedField;
+
+      // Swap in the question's box BEFORE gradedBox is read from it, so the
+      // row below comes from the question and everything downstream follows
+      // without knowing the difference.
+      if (gradedUnusable && hasTrustedBoxes(frageField)) {
+        const why = hasBoxes(gradedField) ? 'low confidence' : 'no box of its own';
+        field = frageField;
+        if (MARGIN_MODE) {
+          rowFromQuestion = true;
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the answer's box had ${why}; in margin mode the box supplies only the row, so the row was taken from this row's question instead`);
+        } else {
+          withheldToMargin = true;
+          positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the answer's box had ${why}, so the mark is NOT placed on the item; its value is drawn in amber in the right margin, on the row the question gives`);
+        }
+      }
 
       if (!hasBoxes(field)) {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
@@ -1309,7 +1357,7 @@ app.post('/annotate', async (req, res) => {
       // down, so wrapping it would scope them away. The cost is that repair
       // notes can still reach positionWarnings in margin mode; they are
       // informational, and this template returned no warnings at all before.
-      if (MARGIN_MODE) {
+      if (MARGIN_MODE || withheldToMargin) {
         x1 = RIGHT_MARGIN_X_FRACTION;
         y1 = rowAnchorY(gradedBox, lineHeightNorm);
         rightAlignMark = true;   // the label must END at the margin, not start there
@@ -1343,7 +1391,12 @@ app.post('/annotate', async (req, res) => {
       }
       lastMarkPosByPage[pageIndex] = { x: xPos, y: yTop };
 
-      const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
+      // Amber, not green/red: the value is right but its placement was not
+      // trusted, and the colour has to say the second thing without denying
+      // the first. Same amber as a warned subtotal and the manual-check note.
+      const color = withheldToMargin
+        ? rgb(0.85, 0.45, 0)
+        : (verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0));
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
         ? `${fmtPoints(verdict.pointsAwarded ?? 0)}/${fmtPoints(verdict.pointsPossible)}P`
         : (verdict.isCorrect ? 'OK' : 'X');
@@ -1369,6 +1422,11 @@ app.post('/annotate', async (req, res) => {
 
 
       annotatedCount++;
+      if (withheldToMargin) {
+        marginWithheld.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (${pointsLabel})`);
+      } else if (rowFromQuestion) {
+        rowRecovered.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (${pointsLabel})`);
+      }
     }
 
     // Draw a per-sub-part subtotal (e.g. "3.5P / 5.0P") near the first row
@@ -1766,7 +1824,10 @@ app.post('/annotate', async (req, res) => {
       pdfPageCount: pages.length,
       // Point pools left unmarked on purpose, for the workflow to surface.
       // Non-empty means no total and no grade were drawn either.
-      manualCheckPools
+      manualCheckPools,
+      // Marks whose placement was degraded rather than refused outright.
+      marginWithheld,
+      rowRecovered
     });
 
   } catch (err) {
