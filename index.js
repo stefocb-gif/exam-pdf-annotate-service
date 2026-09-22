@@ -1082,7 +1082,15 @@ app.post('/annotate', async (req, res) => {
       const useHybridAnchor =
         (exerciseType === 'true_false_correction' && posField === 'antwort' && subPart !== 'b') ||
         (exerciseType === 'case_identification' && (posField === 'fall' || posField === 'antwort')) ||
-        (exerciseType === 'preposition_only' && posField === 'antwort') ||
+        // preposition_only means a blank INSIDE the question's own line on the
+        // Grammatik sheet, so the frage gives the right row there. In a heading
+        // layout it means something else entirely - Geschichte's 2a is six
+        // blank lines UNDER a heading - and borrowing the heading's row put all
+        // six marks on the printed question, at their own columns, so three
+        // pairs landed on top of each other and only three were visible.
+        // Reported 22.09.2026; the six answer boxes were correct and high
+        // confidence all along.
+        (!HEADING_LAYOUT && exerciseType === 'preposition_only' && posField === 'antwort') ||
         // Blank and "Fall:" line sit on the sentence's own line. Taking the
         // row from the sentence keeps two rows with the same case ("Dativ",
         // boxed once for both) on their own lines.
@@ -1541,10 +1549,40 @@ app.post('/annotate', async (req, res) => {
         // then dropped entirely, even though antwort/fall had perfectly
         // good coordinates sitting right there.
         // Prefer any row of the exercise with a position, not just the first.
-        let anchorField = [row.frage, row.antwort, row.fall].find(hasTrustedBoxes);
+        // ORDER MATTERS in a heading layout. Preferring frage there anchors the
+        // subtotal to the exercise's HEADING rather than to its answers, which
+        // is how 2a's subtotal came to sit on the printed question line
+        // (22.09.2026). Where the question shares its row with the answer -
+        // Grammatik, Hoerverstehen - the two boxes are on the same line and the
+        // order makes no difference, so this cannot move them.
+        const anchorPreference = HEADING_LAYOUT
+          ? [row.antwort, row.frage, row.fall]
+          : [row.frage, row.antwort, row.fall];
+        let anchorField = anchorPreference.find(hasTrustedBoxes);
         if (!anchorField) {
-          const other = answers.find(a => a && matchesExercise(a) && [a.frage, a.antwort, a.fall].some(hasTrustedBoxes));
-          if (other) anchorField = [other.frage, other.antwort, other.fall].find(hasTrustedBoxes);
+          // Borrowing from ANY row of the exercise is fine when the exercise is
+          // one block. In a heading layout its pools are separate blocks on the
+          // page, so pool 2b - whose only row came back low confidence - took
+          // 2a's heading and its subtotal was drawn against the wrong question.
+          // Restricted to the pool's own rows there; with none, the code below
+          // places it in the gap between the neighbouring exercises, which is
+          // where the pool actually sits.
+          const sameExercise = (a) => a && matchesExercise(a);
+          const samePool = (a) => {
+            if (!sameExercise(a)) return false;
+            const raw = fieldValue(a.subPart);
+            const letter = raw ? String(raw).trim().charAt(0) : raw;
+            if (subPartLetter === 'a') return letter === 'a' || !letter;
+            if (subPartLetter) return letter === subPartLetter;
+            return !letter;
+          };
+          const eligible = HEADING_LAYOUT ? samePool : sameExercise;
+          const other = answers.find(a => eligible(a) && [a.frage, a.antwort, a.fall].some(hasTrustedBoxes));
+          if (other) {
+            anchorField = (HEADING_LAYOUT
+              ? [other.antwort, other.frage, other.fall]
+              : [other.frage, other.antwort, other.fall]).find(hasTrustedBoxes);
+          }
         }
 
         // No row of the exercise has a position at all (Aufgabe 3 on one
