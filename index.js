@@ -145,6 +145,23 @@ const LARGE_COLUMN_OUTLIER = 0.25;
 const CONTAINMENT_ABOVE = 0.02;
 const CONTAINMENT_BELOW = 0.06;
 
+// ...except where the question is a HEADING and the answers are a block under
+// it, which is how the Geschichte sheet is laid out: 1b is a four-column
+// table under its question, 2a is six blank lines, 4a is a figure. There the
+// answer legitimately sits far below its frage and 0.06 rejects a correct
+// coordinate, snapping the mark onto the printed question line - which is
+// exactly what the teacher reported on the first annotated paper (22.09.2026).
+//
+// Measured on execution 565, all 23 rows, answer boxes at confidence high:
+//   1b Grund 1-4  0.068 - 0.072      4a 1-3   0.075 / 0.124 / 0.163
+//   2a 4          0.060              5b       0.183  <- largest legitimate gap
+// Nine of 23 were being repaired away. 0.20 clears the largest by ~10%.
+//
+// CONTAINMENT_ABOVE is deliberately NOT relaxed: the mis-citation this repair
+// was built for sat 0.139 ABOVE its row, and that guard still catches it.
+// STATED PLAINLY: measured on one paper. A second paper could widen it again.
+const CONTAINMENT_BELOW_HEADING_LAYOUT = 0.20;
+
 // How close a box's left edge must be to its sentence's left edge to count
 // as having collapsed onto the sentence start. Not zero: the frage box
 // often includes the printed item number ("2."), so a collapsed answer box
@@ -828,7 +845,15 @@ app.post('/annotate', async (req, res) => {
     // whether every threshold suits an A4 landscape photo of a handwritten
     // sheet is not yet measured, so the first paper needs looking at.
     const ON_ITEM_TYPES = new Set(['grammatik', 'geschichte']);
-    const MARGIN_MODE = !ON_ITEM_TYPES.has(String(examType || '').trim().toLowerCase());
+    const examTypeKey = String(examType || '').trim().toLowerCase();
+    const MARGIN_MODE = !ON_ITEM_TYPES.has(examTypeKey);
+
+    // A layout where the question is a HEADING over a block of answers, rather
+    // than a line sharing its row with one. It changes two things: how far
+    // below its frage an answer may legitimately sit, and where the per-pool
+    // subtotals go. See CONTAINMENT_BELOW_HEADING_LAYOUT.
+    const HEADING_LAYOUT = examTypeKey === 'geschichte';
+    const containmentBelow = HEADING_LAYOUT ? CONTAINMENT_BELOW_HEADING_LAYOUT : CONTAINMENT_BELOW;
 
     // EXERCISES THE TEACHER HAS TO COUNT HERSELF.
     //
@@ -1338,7 +1363,7 @@ app.post('/annotate', async (req, res) => {
       // above: nothing legitimately sits above the line it belongs to.
       if (frageBox && frageBox.length >= 4) {
         const above = frageBox[1] - CONTAINMENT_ABOVE;
-        const below = frageBox[3] + CONTAINMENT_BELOW;
+        const below = frageBox[3] + containmentBelow;
         if (y1 < above || y1 > below) {
           // A box that landed on another row is wrong in BOTH axes, not just
           // vertically: the one cited to the header carried that header
@@ -1479,7 +1504,18 @@ app.post('/annotate', async (req, res) => {
         const matchesExercise = (a) => String(fieldValue(a.exerciseNumber)) === String(exNum);
         let firstRowIndex = answers.findIndex(a => {
           if (!matchesExercise(a)) return false;
-          const rowSubPart = fieldValue(a.subPart);
+          // Compare the POOL LETTER, not the whole subPart. A schema may
+          // number the items inside a sub-part - Geschichte emits "b Grund 1"
+          // for a table row, "a 1" for a list line, "b 1" for a true/false
+          // statement - and node 21 already keys its pools on the first
+          // character alone. Matching the whole string here meant pools 1b,
+          // 2a, 3b and 4a found no row of their own and silently fell back to
+          // the exercise's FIRST row, so 1b's subtotal was drawn against 1a.
+          // Reported on the first annotated Geschichte paper (22.09.2026).
+          // Hoerverstehen and Grammatik carry bare letters, so charAt(0) is
+          // the same string for them and nothing moves.
+          const rowSubPartRaw = fieldValue(a.subPart);
+          const rowSubPart = rowSubPartRaw ? String(rowSubPartRaw).trim().charAt(0) : rowSubPartRaw;
           if (subPartLetter === 'a') return rowSubPart === 'a' || !rowSubPart; // null/undefined subPart defaults to 'a' by convention (matches node 21 and the true_false_correction template)
           if (subPartLetter) return rowSubPart === subPartLetter;
           return !rowSubPart; // no letter in key means match rows with no subPart
@@ -1628,11 +1664,18 @@ app.post('/annotate', async (req, res) => {
         // In margin mode the flagged subtotal goes where that template's marks
         // go — the right margin — rather than reintroducing a left-hand column
         // the Hoerverstehen paper has never had.
-        const xNorm = MARGIN_MODE ? RIGHT_MARGIN_X_FRACTION : (SUBTOTAL_LEFT_INSET / visualW);
+        // The left-edge column is a Grammatik idea: that sheet's marks sit on
+        // the items and leave the left margin empty. On the Geschichte sheet
+        // the printed tables and figures run close to the left edge, so the
+        // column landed on top of the content - reported on the first
+        // annotated paper (22.09.2026). Those subtotals go to the right
+        // margin instead, where nothing competes with them.
+        const subtotalsRight = MARGIN_MODE || HEADING_LAYOUT;
+        const xNorm = subtotalsRight ? RIGHT_MARGIN_X_FRACTION : (SUBTOTAL_LEFT_INSET / visualW);
         const pos = toRawCoords(xNorm, anchorY, width, height, rotationAngle);
         let subX = pos.x;
         let subY = pos.y;
-        if (MARGIN_MODE) {
+        if (subtotalsRight) {
           // right-aligned, so the label ends at the margin
           const w = labelFontBold.widthOfTextAtSize(subtotalText, SUBTOTAL_FONT_SIZE);
           const rad = (rotationAngle * Math.PI) / 180;
