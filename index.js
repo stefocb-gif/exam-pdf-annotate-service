@@ -1549,16 +1549,18 @@ app.post('/annotate', async (req, res) => {
         // then dropped entirely, even though antwort/fall had perfectly
         // good coordinates sitting right there.
         // Prefer any row of the exercise with a position, not just the first.
-        // ORDER MATTERS in a heading layout. Preferring frage there anchors the
-        // subtotal to the exercise's HEADING rather than to its answers, which
-        // is how 2a's subtotal came to sit on the printed question line
-        // (22.09.2026). Where the question shares its row with the answer -
-        // Grammatik, Hoerverstehen - the two boxes are on the same line and the
-        // order makes no difference, so this cannot move them.
-        const anchorPreference = HEADING_LAYOUT
-          ? [row.antwort, row.frage, row.fall]
-          : [row.frage, row.antwort, row.fall];
-        let anchorField = anchorPreference.find(hasTrustedBoxes);
+        // The frage is the right anchor, including in a heading layout: it is
+        // where the exercise STARTS on the page, and since these subtotals go
+        // to the right margin it covers nothing.
+        //
+        // Anchoring to the answer instead was tried on 22.09.2026 and reverted
+        // the same day. It suits 2a, whose lines sit straight under their
+        // question, and fails 4a, whose three labels are inside a FIGURE at
+        // y 0.284-0.387 while 4b's question is already at 0.236 - so 4a's
+        // subtotal was pushed below 4b's. A question box does not move around
+        // like that. What actually broke 2a was two subtotals stacking on one
+        // row, which the pool restriction below fixes.
+        let anchorField = [row.frage, row.antwort, row.fall].find(hasTrustedBoxes);
         if (!anchorField) {
           // Borrowing from ANY row of the exercise is fine when the exercise is
           // one block. In a heading layout its pools are separate blocks on the
@@ -1578,11 +1580,7 @@ app.post('/annotate', async (req, res) => {
           };
           const eligible = HEADING_LAYOUT ? samePool : sameExercise;
           const other = answers.find(a => eligible(a) && [a.frage, a.antwort, a.fall].some(hasTrustedBoxes));
-          if (other) {
-            anchorField = (HEADING_LAYOUT
-              ? [other.antwort, other.frage, other.fall]
-              : [other.frage, other.antwort, other.fall]).find(hasTrustedBoxes);
-          }
+          if (other) anchorField = [other.frage, other.antwort, other.fall].find(hasTrustedBoxes);
         }
 
         // No row of the exercise has a position at all (Aufgabe 3 on one
