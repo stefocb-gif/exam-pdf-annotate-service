@@ -790,7 +790,7 @@ function nudgeVisualDown(x, y, distance, rotationAngle) {
 }
 
 app.get('/', (req, res) => {
-  res.send('PDF annotation service is running. POST to /annotate.');
+  res.send('PDF annotation service is running. POST to /annotate, or /merge to join annotated papers into one PDF.');
 });
 
 app.post('/annotate', async (req, res) => {
@@ -1767,6 +1767,106 @@ app.post('/annotate', async (req, res) => {
       // Point pools left unmarked on purpose, for the workflow to surface.
       // Non-empty means no total and no grade were drawn either.
       manualCheckPools
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// POST /merge - put a cohort's annotated papers back into one PDF
+//
+// WHY THIS EXISTS
+// The teacher has started handing over ONE scan containing every student's
+// paper instead of one file per student. The pipeline grades one student per
+// run - the extraction schema has a single studentName and one set of answers
+// - so the scan is split before it reaches DocuPipe, and each paper comes back
+// annotated on its own. She should get back what she sent: one marked-up file,
+// in her original page order.
+//
+// The splitting happens on the caller's side and needs no PDF library, because
+// a page tree is just an object listing pages and a subset of it can be written
+// as an incremental update. Merging cannot be done that way - it means copying
+// objects between documents, which is exactly what pdf-lib already does here.
+//
+// SHAPE
+//   in : { pdfs: [ "<base64>", "<base64>", ... ] }   ORDER IS THE PAGE ORDER
+//   out: { mergedPdfBase64, pageCount, sources, pagesPerSource }
+//
+// WHAT IS PRESERVED: copyPages carries each page's /Rotate and MediaBox with
+// it. That matters more here than it looks - every coordinate this service
+// draws with is measured against them, and the scans arrive rotated 90 or 270.
+//
+// A USEFUL SIDE EFFECT: the split files each carry the whole original document,
+// with the other students' pages left in as unreferenced orphans. copyPages
+// takes only the pages that are actually in the tree, so the merged file is
+// clean and roughly the size of the original rather than N times it.
+//
+// FAILS LOUDLY, BY INDEX. A cohort merge that silently drops or reorders a
+// paper would hand the teacher a plausible-looking document with someone's
+// exam missing - the same shape of silent, total failure as the swapped form
+// files of execution 375 and the hand-edited schema id before Change 3.
+app.post('/merge', async (req, res) => {
+  try {
+    const parts = req.body && req.body.pdfs;
+
+    if (!Array.isArray(parts)) {
+      return res.status(400).json({ error: 'Body must be { pdfs: [ base64, ... ] } - "pdfs" was not an array.' });
+    }
+    if (parts.length === 0) {
+      return res.status(400).json({ error: '"pdfs" is empty - nothing to merge.' });
+    }
+    for (let i = 0; i < parts.length; i++) {
+      if (typeof parts[i] !== 'string' || parts[i].length === 0) {
+        return res.status(400).json({ error: `pdfs[${i}] is not a non-empty base64 string.` });
+      }
+    }
+
+    const merged = await PDFDocument.create();
+    const pagesPerSource = [];
+
+    for (let i = 0; i < parts.length; i++) {
+      let source;
+      try {
+        source = await PDFDocument.load(Buffer.from(parts[i], 'base64'));
+      } catch (err) {
+        // Name the input rather than the symptom: with twenty papers in the
+        // body, "Invalid PDF structure" on its own says nothing about which.
+        return res.status(400).json({
+          error: `pdfs[${i}] could not be read as a PDF: ${err.message}`,
+          failedIndex: i
+        });
+      }
+
+      const indices = source.getPageIndices();
+      if (indices.length === 0) {
+        return res.status(400).json({ error: `pdfs[${i}] has no pages.`, failedIndex: i });
+      }
+
+      const copied = await merged.copyPages(source, indices);
+      copied.forEach(page => merged.addPage(page));
+      pagesPerSource.push(indices.length);
+    }
+
+    const bytes = await merged.save();
+    const pageCount = merged.getPageCount();
+
+    // The count is the caller's cross-check: it should equal the page count of
+    // the scan that was split, and a mismatch means a paper was lost on the way
+    // through. Cheap to compute here, impossible to notice by looking.
+    const expected = pagesPerSource.reduce((a, b) => a + b, 0);
+    if (pageCount !== expected) {
+      return res.status(500).json({ error: `merged ${pageCount} pages but the sources hold ${expected}.` });
+    }
+
+    res.json({
+      mergedPdfBase64: Buffer.from(bytes).toString('base64'),
+      pageCount,
+      sources: parts.length,
+      pagesPerSource
     });
 
   } catch (err) {
