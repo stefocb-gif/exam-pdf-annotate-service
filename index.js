@@ -812,9 +812,23 @@ app.post('/annotate', async (req, res) => {
     //                    the Hoerverstehen template was built for and what it
     //                    still does, unchanged.
     //
-    // Anything that is not explicitly Grammatik uses the margin, so a new exam
-    // type gets the safe behaviour rather than a repair layer tuned elsewhere.
-    const MARGIN_MODE = String(examType || '').trim().toLowerCase() !== 'grammatik';
+    // Anything not on this list uses the margin, so a new exam type still gets
+    // the safe behaviour rather than a repair layer tuned elsewhere.
+    //
+    // Geschichte joined the list on 22.09.2026, at the teacher's request after
+    // reading the first annotated paper: in margin mode the marks for 1b's
+    // four table rows and 2a's six list lines all resolve to nearly the same
+    // right-margin height and pile up on each other - the run logged "nudged:
+    // landed on top of the previous mark" six times, and 4a's three marks came
+    // out level with 4b. She asked for them on the item, "like exercise 1 from
+    // the Grammatik test".
+    //
+    // STATED PLAINLY: the repair layer's thresholds were measured on the
+    // Kurztest layout, not this one. This gives Geschichte the right STRATEGY;
+    // whether every threshold suits an A4 landscape photo of a handwritten
+    // sheet is not yet measured, so the first paper needs looking at.
+    const ON_ITEM_TYPES = new Set(['grammatik', 'geschichte']);
+    const MARGIN_MODE = !ON_ITEM_TYPES.has(String(examType || '').trim().toLowerCase());
 
     // EXERCISES THE TEACHER HAS TO COUNT HERSELF.
     //
