@@ -971,7 +971,10 @@ app.post('/annotate', async (req, res) => {
     const poolOf = (row, markAs) => {
       const sp = fieldValue(row && row.subPart);
       let ps = sp ? String(sp).trim().charAt(0) : '';
-      if (fieldValue(row && row.exerciseType) === 'true_false_correction') {
+      // Change 28 mirror: split by markAs only when the row names no pool of its
+      // own. Geschichte's 3b rows carry subPart 'b 1'..'b 4' beside a free-text
+      // 3a, and node 21 books all their verdicts into 3b.
+      if (fieldValue(row && row.exerciseType) === 'true_false_correction' && !ps) {
         ps = markAs === 'correction' ? 'b' : 'a';
       }
       return String(fieldValue(row && row.exerciseNumber)) + ps;
@@ -1027,7 +1030,7 @@ app.post('/annotate', async (req, res) => {
       // so "2d i" pools as "2d" - and true_false_correction splits one row into
       // an "a" judgment and a "b" correction via markAs rather than subPart.
       let poolSub = subPart ? String(subPart).trim().charAt(0) : '';
-      if (exerciseType === 'true_false_correction') {
+      if (exerciseType === 'true_false_correction' && !poolSub) {
         poolSub = verdict.markAs === 'correction' ? 'b' : 'a';
       }
       const poolKey = String(fieldValue(row && row.exerciseNumber)) + poolSub;
