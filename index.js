@@ -963,6 +963,42 @@ app.post('/annotate', async (req, res) => {
       ...buildColumnRepairMap(answers, 'frage')
     ]);
     const judgmentColumns = buildJudgmentColumnMap(answers);
+
+    // HEADING LAYOUT, TRUE/FALSE BLOCK (Geschichte 3b): two fixed columns.
+    // Each correction used to be drawn just after the end of ITS OWN
+    // sentence, and the sentences differ in length, so the marks stood at a
+    // different x on every row; where a row had no usable box at all, the
+    // judgment landed on the same spot and was nudged aside. The teacher
+    // asked for the marks to line up (22.09.2026). Corrections now share one
+    // column just after the block's LONGEST sentence on that page, and
+    // judgments sit in the tick column, measured from any row whose answer
+    // box is the small checkbox itself.
+    const tfColumns = new Map();   // "exercise|page" -> { sentenceEnd, tickX }
+    if (HEADING_LAYOUT) {
+      const ticksByEx = new Map();
+      answers.forEach(r => {
+        if (!r || fieldValue(r.exerciseType) !== 'true_false_correction') return;
+        const ex = String(fieldValue(r.exerciseNumber));
+        if (hasTrustedBoxes(r.frage)) {
+          const key = `${ex}|${r.frage.review.page}`;
+          const c = tfColumns.get(key) || { ex, sentenceEnd: 0, tickX: null };
+          c.sentenceEnd = Math.max(c.sentenceEnd, r.frage.review.boundingBoxes[0][2]);
+          tfColumns.set(key, c);
+        }
+        const a = r.antwort;
+        if (hasTrustedBoxes(a) && !a.review.inferred) {
+          const b = a.review.boundingBoxes[0];
+          if (b[2] - b[0] < 0.03) {
+            if (!ticksByEx.has(ex)) ticksByEx.set(ex, []);
+            ticksByEx.get(ex).push(b[0]);
+          }
+        }
+      });
+      for (const c of tfColumns.values()) {
+        const xs = (ticksByEx.get(c.ex) || []).sort((p, q) => p - q);
+        c.tickX = xs.length ? xs[Math.floor(xs.length / 2)] : null;
+      }
+    }
     const duplicateFrageRows = buildDuplicateFrageSet(answers);
 
     // Which pools actually produced a verdict. Used to tell a pool that scored
@@ -1413,7 +1449,30 @@ app.post('/annotate', async (req, res) => {
         rightAlignMark = true;   // the label must END at the margin, not start there
       }
 
-      if (correctionWithoutOwnBox) {
+      let tfColumnPlaced = false;
+      if (HEADING_LAYOUT && isTrueFalse && !MARGIN_MODE && !withheldToMargin) {
+        const c = tfColumns.get(`${fieldValue(row && row.exerciseNumber)}|${field.review.page}`);
+        if (c && c.sentenceEnd > 0) {
+          const sideways = rotationAngle === 90 || rotationAngle === 270;
+          const visualW = sideways ? height : width;
+          const gap = 8 / visualW;
+          const labelW = (MARK_FONT_SIZE * 6) / visualW;   // room for "0.63/0.63P"
+          const correctionX = c.sentenceEnd + gap;
+          // The tick column only if it leaves room for the correction label;
+          // otherwise the judgment goes one label-width after the corrections.
+          const judgmentX = (c.tickX !== null && c.tickX >= correctionX + labelW)
+            ? c.tickX
+            : correctionX + labelW + gap;
+          x1 = isCorrectionMark ? correctionX : judgmentX;
+          if (frageBox && frageField.review.page === field.review.page) {
+            y1 = rowAnchorY(frageBox, lineHeightNorm);
+          }
+          rightAlignMark = false;
+          tfColumnPlaced = true;
+        }
+      }
+
+      if (correctionWithoutOwnBox && !tfColumnPlaced) {
         if (correctionPlacedBesideSentence) {
           positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - no correction was written, so this verdict has no box of its own; drawn just after the sentence, in the strip before the judgment columns`);
         } else {
@@ -1435,7 +1494,7 @@ app.post('/annotate', async (req, res) => {
       // positionWarnings is a signal to investigate, not a fix.
       const COLLISION_THRESHOLD = 4; // px
       const lastPos = lastMarkPosByPage[pageIndex];
-      if (lastPos && Math.abs(xPos - lastPos.x) < COLLISION_THRESHOLD && Math.abs(yTop - lastPos.y) < COLLISION_THRESHOLD) {
+      if (!tfColumnPlaced && lastPos && Math.abs(xPos - lastPos.x) < COLLISION_THRESHOLD && Math.abs(yTop - lastPos.y) < COLLISION_THRESHOLD) {
         ({ x: xPos, y: yTop } = nudgeVisualDown(xPos, yTop, 14, rotationAngle));
         positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - nudged: landed on top of the previous mark; this is a visibility fix only, not a confirmed correct position`);
       }
