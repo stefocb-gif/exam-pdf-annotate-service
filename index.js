@@ -936,6 +936,7 @@ app.post('/annotate', async (req, res) => {
     // Marks that were not placed the ordinary way - reported so the
     // workflow can surface them rather than leaving them to be noticed.
     const marginWithheld = [];   // Grammatik: value shown in the margin, not on the item
+    const marginRowUse = new Map();   // "page|row" -> margin marks already on that row
     const rowRecovered = [];     // margin mode: row taken from the question box
     const positionWarnings = [];
     const lastMarkPosByPage = {};
@@ -1466,6 +1467,15 @@ app.post('/annotate', async (req, res) => {
         x1 = RIGHT_MARGIN_X_FRACTION;
         y1 = rowAnchorY(gradedBox, lineHeightNorm);
         rightAlignMark = true;   // the label must END at the margin, not start there
+        // Several on-item marks moved to the margin on one row (three on one
+        // row of Kurztest A5) were drawn on top of each other. Side by side.
+        if (withheldToMargin) {
+          const rowKey = `${pageIndex}|${Math.round(y1 * 150)}`;
+          const k = marginRowUse.get(rowKey) || 0;
+          marginRowUse.set(rowKey, k + 1);
+          const visualWm = (rotationAngle === 90 || rotationAngle === 270) ? height : width;
+          x1 -= k * (MARK_FONT_SIZE * 4.6) / visualWm;
+        }
       }
 
       let tfColumnPlaced = false;
@@ -1545,9 +1555,9 @@ app.post('/annotate', async (req, res) => {
       // Amber, not green/red: the value is right but its placement was not
       // trusted, and the colour has to say the second thing without denying
       // the first. Same amber as a warned subtotal and the manual-check note.
-      const color = withheldToMargin
-        ? rgb(0.85, 0.45, 0)
-        : (verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0));
+      // Normal green/red for an uncertain mark as well (23.09.2026): amber is
+      // reserved for pools the teacher has to check herself.
+      const color = verdict.isCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
       const pointsLabel = (verdict.pointsPossible !== undefined && verdict.pointsPossible !== null)
         ? `${fmtPoints(verdict.pointsAwarded ?? 0)}/${fmtPoints(verdict.pointsPossible)}P`
         : (verdict.isCorrect ? 'OK' : 'X');
@@ -1573,7 +1583,10 @@ app.post('/annotate', async (req, res) => {
         pool: poolKey, verdict, pointsLabel, withheld: withheldToMargin, recovered: rowFromQuestion,
         draw: () => drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont)
       });
-      if (withheldToMargin) unplacedPools.add(poolKey);   // amber = not placed on its item
+      // An uncertain mark (drawn in the margin on its question's row) does NOT
+      // flag its pool: the value was read and graded, only its exact position
+      // on the line is uncertain (23.09.2026). Only a MISSING mark - one that
+      // could not be placed at all and was skipped - hands the pool to her.
       pendingPool = null;
     }
     settleVerdict();
