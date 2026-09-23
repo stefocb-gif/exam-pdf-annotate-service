@@ -1014,6 +1014,83 @@ app.post('/annotate', async (req, res) => {
         }
       }
     }
+    // UNCERTAIN MARKED WORDS - place each on its word within its sentence.
+    // Kurztest Aufgabe 3 is running text: an uncertain word's box is a band
+    // across the line (x 0.08-0.93), so it has neither a column nor a gap to
+    // go to, and in the margin up to four marks stood side by side over the
+    // printed words (A5 line 1, 23.09.2026). But the row carries the whole
+    // sentence as text, and the trusted box of that sentence's segment on the
+    // word's line. The word's place follows from the width of the text in
+    // front of it: a head segment (the sentence starts on this line) is
+    // measured from the left of the box, a tail segment (the sentence began
+    // on the line above) from the right. The scale - page width per em - is
+    // fitted on the trusted words of the same exercise. Repeated words take
+    // their occurrences in reading order.
+    if (!MARGIN_MODE) {
+      const emW = (s) => labelFont.widthOfTextAtSize(s, 1);
+      const occ = (text, word, k) => {
+        const re = new RegExp('(?<!\\p{L})' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?!\\p{L})', 'giu');
+        let m;
+        let n = 0;
+        while ((m = re.exec(text))) { if (n === k) return m.index; n++; }
+        return -1;
+      };
+      const mw = [];
+      answers.forEach((r, i) => { if (r && fieldValue(r.exerciseType) === 'marked_word' && hasTrustedBoxes(r.frage)) mw.push(i); });
+      const seenWord = new Map();
+      const occOf = new Map();
+      for (const i of mw) {
+        const r = answers[i];
+        const key = String(fieldValue(r.frage)) + '|' + String(fieldValue(r.antwort) || '').toLowerCase();
+        const k = seenWord.get(key) || 0;
+        occOf.set(i, k);
+        seenWord.set(key, k + 1);
+      }
+      let num = 0;
+      let den = 0;
+      for (const i of mw) {
+        const r = answers[i];
+        if (!hasTrustedBoxes(r.antwort)) continue;
+        const txt = String(fieldValue(r.frage) || '');
+        const wd = String(fieldValue(r.antwort) || '');
+        if (!wd) continue;
+        const p = occ(txt, wd, occOf.get(i));
+        if (p < 0) continue;
+        const fb = r.frage.review.boundingBoxes[0];
+        const ab = r.antwort.review.boundingBoxes[0];
+        if (fb[0] <= 0.1 && emW(txt) * 0.01 > (fb[2] - fb[0]) + 0.05) continue;   // likely a tail segment
+        const w = emW(txt.slice(0, p));
+        const dx = ab[0] - fb[0];
+        if (w <= 0 || dx <= 0) continue;
+        num += w * dx;
+        den += w * w;
+      }
+      if (den > 0) {
+        const scale = num / den;
+        for (const i of mw) {
+          const r = answers[i];
+          const a = r.antwort;
+          if (!hasValue(a) || hasTrustedBoxes(a)) continue;
+          const txt = String(fieldValue(r.frage) || '');
+          const wd = String(fieldValue(a) || '');
+          if (!wd) continue;
+          const p = occ(txt, wd, occOf.get(i));
+          if (p < 0) continue;
+          const fb = r.frage.review.boundingBoxes[0];
+          const whole = Math.abs(scale * emW(txt) - (fb[2] - fb[0])) <= 0.06;
+          const x = (whole || fb[0] > 0.1)
+            ? fb[0] + scale * emW(txt.slice(0, p))
+            : fb[2] - scale * emW(txt.slice(p));
+          const x1 = x + scale * emW(wd);
+          if (x < fb[0] - 0.02 || x1 > fb[2] + 0.02) continue;
+          r.antwort = {
+            value: fieldValue(a),
+            review: { page: r.frage.review.page, boundingBoxes: [[x, fb[1], x1, fb[3]]], confidence: 'medium', inferred: true }
+          };
+          positionWarnings.push(`answerIndex ${i}, field antwort - the word's box was uncertain; placed on the word, from the sentence text and the trusted box of its line`);
+        }
+      }
+    }
     inferMissingBlankBoxes(answers, positionWarnings, labelFont);
     repairFlownFallBoxes(answers, positionWarnings);
     inferMissingFieldBoxes(answers, positionWarnings);
