@@ -950,6 +950,100 @@ app.post('/annotate', async (req, res) => {
     inferMissingBlankBoxes(answers, positionWarnings, labelFont);
     repairFlownFallBoxes(answers, positionWarnings);
     inferMissingFieldBoxes(answers, positionWarnings);
+
+    // UNCERTAIN ANSWERS IN A TABLE - rebuild the position from the table.
+    // With citations, DocuPipe sometimes returns an answer's box as a band
+    // across the whole line at "low" (Kurztest A3, Aufgabe 2: four of ten
+    // cases, x 0.12-0.91). The value was read; only its place is unknown. But
+    // Aufgabe 1 and 2 are tables: every sentence's answers sit in the same
+    // columns, and the other rows show exactly where (A3: column 1 at ~0.60,
+    // column 2 at ~0.78). So an uncertain answer takes the column of the
+    // trusted answers at the same position within their sentence, and the row
+    // of a trusted answer on its own sentence (or the sentence itself). It is
+    // then drawn on the item like any other mark (23.09.2026) - as all ten were
+    // on 17.09, before citations. Running-text gaps (Aufgabe 4, 6) have no
+    // columns and keep the margin.
+    const GRID_TYPES = ['case_identification', 'qa_composition'];
+    const gridPositions = new Map();   // "answerIndex:field" -> synthetic field
+    {
+      const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+      const groups = new Map();   // exercise|type|page|sentence-row -> answer indices
+      answers.forEach((r, i) => {
+        if (!r || !GRID_TYPES.includes(fieldValue(r.exerciseType))) return;
+        if (!hasTrustedBoxes(r.frage)) return;
+        const fb = r.frage.review.boundingBoxes[0];
+        const key = `${fieldValue(r.exerciseNumber)}|${fieldValue(r.exerciseType)}|${r.frage.review.page}|${Math.round(fb[1] * 100)}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(i);
+      });
+      for (const f of ['frage', 'antwort', 'fall']) {
+        const samples = new Map();   // exercise|type|ordinal -> { x0: [], x1: [] }
+        const members = [];
+        for (const [gkey, idxs] of groups) {
+          const [ex, type] = gkey.split('|');
+          idxs.sort((a, b) => a - b).forEach((i, k) => {
+            const sk = `${ex}|${type}|${k}`;
+            members.push({ i, sk, idxs });
+            const box = answers[i][f];
+            if (isUsableAnswerBox(box) && !box.review.inferred) {
+              if (!samples.has(sk)) samples.set(sk, { x0: [], x1: [] });
+              samples.get(sk).x0.push(box.review.boundingBoxes[0][0]);
+              samples.get(sk).x1.push(box.review.boundingBoxes[0][2]);
+            }
+          });
+        }
+        for (const m of members) {
+          const r = answers[m.i];
+          const box = r[f];
+          if (!hasValue(box) || hasTrustedBoxes(box)) continue;
+          const s = samples.get(m.sk);
+          if (!s || !s.x0.length) continue;
+          const sib = m.idxs.map(j => answers[j][f]).find(b => isUsableAnswerBox(b) && !b.review.inferred);
+          const yb = sib ? sib.review.boundingBoxes[0] : r.frage.review.boundingBoxes[0];
+          const rebuilt = {
+            value: fieldValue(box),
+            review: { page: r.frage.review.page, boundingBoxes: [[med(s.x0), yb[1], med(s.x1), yb[3]]], confidence: 'medium', inferred: true }
+          };
+          gridPositions.set(`${m.i}:${f}`, rebuilt);
+          // Written into the row itself, BEFORE the duplicate-box column repair
+          // below runs: left as identical full-line bands, two uncertain answers
+          // on one sentence read as a collision and the repair pushed a correct
+          // neighbour into the wrong column (A3, sentence 2, 23.09.2026).
+          r[f] = rebuilt;
+          positionWarnings.push(`answerIndex ${m.i}, field ${f} - the answer's box was uncertain; placed in its table column (learned from the other rows) on its own sentence`);
+        }
+      }
+    }
+    // UNCERTAIN GAP ANSWERS - the gap sits just left of the text that follows it.
+    // In a gap text (Kurztest Aufgabe 4) an uncertain answer's box is a band
+    // across the line, but its sentence reads "... ___ <printed text>" and the
+    // box of that printed text is trusted: the gap ends just left of it. On
+    // A3 the trusted answers confirm it ("durch" ends at 0.545, "die Stadt."
+    // starts at 0.591). So the mark goes on its gap instead of into the margin,
+    // where it covered printed words and sat far from its line's start
+    // (23.09.2026). Margin mode (Hoerverstehen) is left alone.
+    if (!MARGIN_MODE) {
+      answers.forEach((r, i) => {
+        if (!r || fieldValue(r.exerciseType) !== 'preposition_only') return;
+        const a = r.antwort;
+        if (!hasValue(a) || hasTrustedBoxes(a) || !hasTrustedBoxes(r.frage)) return;
+        const txt = String(fieldValue(r.frage) || '');
+        const gi = txt.indexOf('___');
+        if (gi < 0) return;
+        const before = txt.slice(0, gi).trim();
+        const after = txt.slice(gi + 3).trim();
+        const fb = r.frage.review.boundingBoxes[0];
+        let xe;
+        if (after && before.split(/\s+/).filter(Boolean).length <= 1) xe = fb[0] - 0.012;
+        else if (before && !after) xe = fb[2] + 0.085;
+        else xe = fb[0] + (gi / Math.max(1, txt.length)) * (fb[2] - fb[0]) + 0.04;
+        r.antwort = {
+          value: fieldValue(a),
+          review: { page: r.frage.review.page, boundingBoxes: [[xe - 0.075, fb[1], xe, fb[3]]], confidence: 'medium', inferred: true }
+        };
+        positionWarnings.push(`answerIndex ${i}, field antwort - the answer's box was uncertain; placed on its gap, just left of the printed text that follows it`);
+      });
+    }
     const mergedSplits = buildMergedSplitMap(answers);
 
     // Built once per request: which rows have a column position corrupted by
@@ -1001,63 +1095,6 @@ app.post('/annotate', async (req, res) => {
       }
     }
     const duplicateFrageRows = buildDuplicateFrageSet(answers);
-
-    // UNCERTAIN ANSWERS IN A TABLE - rebuild the position from the table.
-    // With citations, DocuPipe sometimes returns an answer's box as a band
-    // across the whole line at "low" (Kurztest A3, Aufgabe 2: four of ten
-    // cases, x 0.12-0.91). The value was read; only its place is unknown. But
-    // Aufgabe 1 and 2 are tables: every sentence's answers sit in the same
-    // columns, and the other rows show exactly where (A3: column 1 at ~0.60,
-    // column 2 at ~0.78). So an uncertain answer takes the column of the
-    // trusted answers at the same position within their sentence, and the row
-    // of a trusted answer on its own sentence (or the sentence itself). It is
-    // then drawn on the item like any other mark (23.09.2026) - as all ten were
-    // on 17.09, before citations. Running-text gaps (Aufgabe 4, 6) have no
-    // columns and keep the margin.
-    const GRID_TYPES = ['case_identification', 'qa_composition'];
-    const gridPositions = new Map();   // "answerIndex:field" -> synthetic field
-    {
-      const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
-      const groups = new Map();   // exercise|type|page|sentence-row -> answer indices
-      answers.forEach((r, i) => {
-        if (!r || !GRID_TYPES.includes(fieldValue(r.exerciseType))) return;
-        if (!hasTrustedBoxes(r.frage)) return;
-        const fb = r.frage.review.boundingBoxes[0];
-        const key = `${fieldValue(r.exerciseNumber)}|${fieldValue(r.exerciseType)}|${r.frage.review.page}|${Math.round(fb[1] * 100)}`;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(i);
-      });
-      for (const f of ['frage', 'antwort', 'fall']) {
-        const samples = new Map();   // exercise|type|ordinal -> { x0: [], x1: [] }
-        const members = [];
-        for (const [gkey, idxs] of groups) {
-          const [ex, type] = gkey.split('|');
-          idxs.sort((a, b) => a - b).forEach((i, k) => {
-            const sk = `${ex}|${type}|${k}`;
-            members.push({ i, sk, idxs });
-            const box = answers[i][f];
-            if (isUsableAnswerBox(box) && !box.review.inferred) {
-              if (!samples.has(sk)) samples.set(sk, { x0: [], x1: [] });
-              samples.get(sk).x0.push(box.review.boundingBoxes[0][0]);
-              samples.get(sk).x1.push(box.review.boundingBoxes[0][2]);
-            }
-          });
-        }
-        for (const m of members) {
-          const r = answers[m.i];
-          const box = r[f];
-          if (!hasValue(box) || hasTrustedBoxes(box)) continue;
-          const s = samples.get(m.sk);
-          if (!s || !s.x0.length) continue;
-          const sib = m.idxs.map(j => answers[j][f]).find(b => isUsableAnswerBox(b) && !b.review.inferred);
-          const yb = sib ? sib.review.boundingBoxes[0] : r.frage.review.boundingBoxes[0];
-          gridPositions.set(`${m.i}:${f}`, {
-            value: fieldValue(box),
-            review: { page: r.frage.review.page, boundingBoxes: [[med(s.x0), yb[1], med(s.x1), yb[3]]], confidence: 'medium', inferred: true }
-          });
-        }
-      }
-    }
 
     // Which pools actually produced a verdict. Used to tell a pool that scored
     // zero because the student left it BLANK from one that is doubtful - see
