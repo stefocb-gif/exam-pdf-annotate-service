@@ -1464,7 +1464,7 @@ app.post('/annotate', async (req, res) => {
           // statement's line, the correction directly under it.
           x1 = 1 - 2 / visualW;
           if (frageBox && frageField.review.page === field.review.page) {
-            y1 = rowAnchorY(frageBox, lineHeightNorm) + (isCorrectionMark ? lineHeightNorm * 1.3 : 0);
+            y1 = rowAnchorY(frageBox, lineHeightNorm) + (isCorrectionMark ? lineHeightNorm * 1.7 : 0);
           }
           rightAlignMark = true;
           tfColumnPlaced = true;
