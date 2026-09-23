@@ -1034,9 +1034,26 @@ app.post('/annotate', async (req, res) => {
     for (const key of [...warnedPools]) {
       if (!poolsWithVerdicts.has(key)) warnedPools.delete(key);
     }
-    const manualCheckPools = [...warnedPools].sort();
+    let manualCheckPools = [...warnedPools].sort();
+
+    // A POOL WITH ANY MARK THAT COULD NOT BE PLACED IS LEFT TO THE TEACHER.
+    // Her rule (23.09.2026): if a mark in an exercise is missing, unreadable or
+    // would come out amber, she grades that exercise herself - so none of its
+    // marks are drawn, its subtotal is amber and the header's total and grade
+    // stay empty for her to add up at the end. Which marks cannot be placed is
+    // only known while placing them, so every mark is collected first and the
+    // drawing happens after the loop.
+    const unplacedPools = new Set();
+    const pendingDraws = [];
+    let pendingPool = null;
+    let pendingSkipLen = 0;
+    const settleVerdict = () => {
+      if (pendingPool !== null && skipped.length > pendingSkipLen) unplacedPools.add(pendingPool);
+      pendingPool = null;
+    };
 
     for (const verdict of verdicts) {
+      settleVerdict();
       const row = answers[verdict.answerIndex];
 
 
@@ -1074,6 +1091,8 @@ app.post('/annotate', async (req, res) => {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (Aufgabe ${poolKey} is flagged for manual checking - no marks are drawn in it)`);
         continue;
       }
+      pendingPool = poolKey;
+      pendingSkipLen = skipped.length;
 
       // In case_identification antwort and fall hold the same answer, and
       // which of the two DocuPipe fills varies from paper to paper - one
@@ -1550,14 +1569,28 @@ app.post('/annotate', async (req, res) => {
         yTop -= w * Math.sin(rad);
       }
 
-      drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont);
+      pendingDraws.push({
+        pool: poolKey, verdict, pointsLabel, withheld: withheldToMargin, recovered: rowFromQuestion,
+        draw: () => drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont)
+      });
+      if (withheldToMargin) unplacedPools.add(poolKey);   // amber = not placed on its item
+      pendingPool = null;
+    }
+    settleVerdict();
 
-
+    for (const pool of unplacedPools) warnedPools.add(pool);
+    manualCheckPools = [...warnedPools].sort();
+    for (const d of pendingDraws) {
+      if (warnedPools.has(d.pool)) {
+        skipped.push(`answerIndex ${d.verdict.answerIndex}, field ${d.verdict.field} (Aufgabe ${d.pool} is flagged for manual checking - a mark in it could not be placed, so none of its marks are drawn)`);
+        continue;
+      }
+      d.draw();
       annotatedCount++;
-      if (withheldToMargin) {
-        marginWithheld.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (${pointsLabel})`);
-      } else if (rowFromQuestion) {
-        rowRecovered.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (${pointsLabel})`);
+      if (d.withheld) {
+        marginWithheld.push(`answerIndex ${d.verdict.answerIndex}, field ${d.verdict.field} (${d.pointsLabel})`);
+      } else if (d.recovered) {
+        rowRecovered.push(`answerIndex ${d.verdict.answerIndex}, field ${d.verdict.field} (${d.pointsLabel})`);
       }
     }
 
