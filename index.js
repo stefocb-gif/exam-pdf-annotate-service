@@ -1455,21 +1455,44 @@ app.post('/annotate', async (req, res) => {
         if (c && c.sentenceEnd > 0) {
           const sideways = rotationAngle === 90 || rotationAngle === 270;
           const visualW = sideways ? height : width;
-          const gap = 8 / visualW;
-          const labelW = (MARK_FONT_SIZE * 6) / visualW;   // room for "0.63/0.63P"
-          const correctionX = c.sentenceEnd + gap;
-          // The tick column only if it leaves room for the correction label;
-          // otherwise the judgment goes one label-width after the corrections.
-          const judgmentX = (c.tickX !== null && c.tickX >= correctionX + labelW)
-            ? c.tickX
-            : correctionX + labelW + gap;
-          x1 = isCorrectionMark ? correctionX : judgmentX;
+          // Neither gap in the printed row holds a label: between the longest
+          // sentence and the "falsch" checkbox there is 0.077 of the page width
+          // against a label of 0.081, and a column there covered the checkboxes
+          // and the pupil's cross (seen on the render of b42f9e5, 23.09.2026).
+          // Right of "korrekt" there is room, so both marks of a row go there,
+          // right-aligned 2pt inside the page edge: the judgment on the
+          // statement's line, the correction directly under it.
+          x1 = 1 - 2 / visualW;
           if (frageBox && frageField.review.page === field.review.page) {
-            y1 = rowAnchorY(frageBox, lineHeightNorm);
+            y1 = rowAnchorY(frageBox, lineHeightNorm) + (isCorrectionMark ? lineHeightNorm * 1.3 : 0);
           }
-          rightAlignMark = false;
+          rightAlignMark = true;
           tfColumnPlaced = true;
         }
+      }
+
+      // HEADING LAYOUT, SPLIT POOL (Geschichte 1b, Grund / Erklaerung): the
+      // extraction boxes only the FIRST part - the Grund cell. The later part is
+      // written in the cell below, which has no box of its own, so its mark sat
+      // on the Grund cell and was nudged. It now goes to the bottom of that
+      // cell, right-aligned under the first part's mark, which is where the
+      // teacher writes her own points: just above the next located box below
+      // on the page, or above the bottom margin when there is none.
+      let splitPartPlaced = false;
+      const partNo = /^part(\d+)$/.exec(String(verdict.markAs || ''));
+      if (HEADING_LAYOUT && partNo && Number(partNo[1]) > 1 && !MARGIN_MODE && !withheldToMargin) {
+        let nextTop = 0.90;
+        for (const a of answers) {
+          for (const f of [a && a.frage, a && a.antwort, a && a.fall]) {
+            if (!hasTrustedBoxes(f) || f.review.inferred || f.review.page !== field.review.page) continue;
+            const top = f.review.boundingBoxes[0][1];
+            if (top > gradedBox[3] + 0.02 && top < nextTop) nextTop = top;
+          }
+        }
+        x1 = gradedBox[2];
+        y1 = nextTop - 0.024;
+        rightAlignMark = true;
+        splitPartPlaced = true;
       }
 
       if (correctionWithoutOwnBox && !tfColumnPlaced) {
@@ -1494,7 +1517,7 @@ app.post('/annotate', async (req, res) => {
       // positionWarnings is a signal to investigate, not a fix.
       const COLLISION_THRESHOLD = 4; // px
       const lastPos = lastMarkPosByPage[pageIndex];
-      if (!tfColumnPlaced && lastPos && Math.abs(xPos - lastPos.x) < COLLISION_THRESHOLD && Math.abs(yTop - lastPos.y) < COLLISION_THRESHOLD) {
+      if (!tfColumnPlaced && !splitPartPlaced && lastPos && Math.abs(xPos - lastPos.x) < COLLISION_THRESHOLD && Math.abs(yTop - lastPos.y) < COLLISION_THRESHOLD) {
         ({ x: xPos, y: yTop } = nudgeVisualDown(xPos, yTop, 14, rotationAngle));
         positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - nudged: landed on top of the previous mark; this is a visibility fix only, not a confirmed correct position`);
       }
@@ -1756,7 +1779,13 @@ app.post('/annotate', async (req, res) => {
         // subtotals line up in one column down the edge. The inset is given
         // in points and converted through the usual transform, so it stays
         // at the visual left edge on a rotated page too.
-        const anchorY = rowAnchorY(anchorBox, lineHeightNorm);
+        let anchorY = rowAnchorY(anchorBox, lineHeightNorm);
+        // A true/false pool's first row is its first statement, whose right end
+        // now carries that row's marks. Its subtotal goes one line up, onto the
+        // sub-part heading ("b. Kreuze an ..."), so the two do not collide.
+        if (HEADING_LAYOUT && fieldValue(row && row.exerciseType) === 'true_false_correction') {
+          anchorY = Math.max(0, anchorBox[1] - 0.014);
+        }
         const sideways = rotationAngle === 90 || rotationAngle === 270;
         const visualW = sideways ? height : width;
         // In margin mode the flagged subtotal goes where that template's marks
