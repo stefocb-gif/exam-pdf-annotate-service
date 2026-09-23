@@ -947,11 +947,11 @@ app.post('/annotate', async (req, res) => {
     // object, and that must never leak back into the caller's data.
     const answers = (reviewData.answers || []).map(r => (r ? { ...r } : r));
     inferMissingFrageBoxes(answers, positionWarnings);
-    inferMissingBlankBoxes(answers, positionWarnings, labelFont);
-    repairFlownFallBoxes(answers, positionWarnings);
-    inferMissingFieldBoxes(answers, positionWarnings);
-
     // UNCERTAIN ANSWERS IN A TABLE - rebuild the position from the table.
+    // Runs FIRST: with the full-line bands still in place, repairFlownFallBoxes
+    // read column 2 as "the" case column and moved a correct left-hand answer
+    // (A3, sentence 2) into it. With the bands replaced it leaves it alone,
+    // exactly as the preview of 23.09.2026 showed.
     // With citations, DocuPipe sometimes returns an answer's box as a band
     // across the whole line at "low" (Kurztest A3, Aufgabe 2: four of ten
     // cases, x 0.12-0.91). The value was read; only its place is unknown. But
@@ -1005,8 +1005,8 @@ app.post('/annotate', async (req, res) => {
             review: { page: r.frage.review.page, boundingBoxes: [[med(s.x0), yb[1], med(s.x1), yb[3]]], confidence: 'medium', inferred: true }
           };
           gridPositions.set(`${m.i}:${f}`, rebuilt);
-          // Written into the row itself, BEFORE the duplicate-box column repair
-          // below runs: left as identical full-line bands, two uncertain answers
+          // Written into the row itself, BEFORE every older repair pass runs (the
+          // flown-case repair and the duplicate-box column repair): left as identical full-line bands, two uncertain answers
           // on one sentence read as a collision and the repair pushed a correct
           // neighbour into the wrong column (A3, sentence 2, 23.09.2026).
           r[f] = rebuilt;
@@ -1014,6 +1014,10 @@ app.post('/annotate', async (req, res) => {
         }
       }
     }
+    inferMissingBlankBoxes(answers, positionWarnings, labelFont);
+    repairFlownFallBoxes(answers, positionWarnings);
+    inferMissingFieldBoxes(answers, positionWarnings);
+
     // UNCERTAIN GAP ANSWERS - the gap sits just left of the text that follows it.
     // In a gap text (Kurztest Aufgabe 4) an uncertain answer's box is a band
     // across the line, but its sentence reads "... ___ <printed text>" and the
