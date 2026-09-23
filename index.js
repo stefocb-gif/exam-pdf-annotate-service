@@ -1002,6 +1002,63 @@ app.post('/annotate', async (req, res) => {
     }
     const duplicateFrageRows = buildDuplicateFrageSet(answers);
 
+    // UNCERTAIN ANSWERS IN A TABLE - rebuild the position from the table.
+    // With citations, DocuPipe sometimes returns an answer's box as a band
+    // across the whole line at "low" (Kurztest A3, Aufgabe 2: four of ten
+    // cases, x 0.12-0.91). The value was read; only its place is unknown. But
+    // Aufgabe 1 and 2 are tables: every sentence's answers sit in the same
+    // columns, and the other rows show exactly where (A3: column 1 at ~0.60,
+    // column 2 at ~0.78). So an uncertain answer takes the column of the
+    // trusted answers at the same position within their sentence, and the row
+    // of a trusted answer on its own sentence (or the sentence itself). It is
+    // then drawn on the item like any other mark (23.09.2026) - as all ten were
+    // on 17.09, before citations. Running-text gaps (Aufgabe 4, 6) have no
+    // columns and keep the margin.
+    const GRID_TYPES = ['case_identification', 'qa_composition'];
+    const gridPositions = new Map();   // "answerIndex:field" -> synthetic field
+    {
+      const med = (arr) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+      const groups = new Map();   // exercise|type|page|sentence-row -> answer indices
+      answers.forEach((r, i) => {
+        if (!r || !GRID_TYPES.includes(fieldValue(r.exerciseType))) return;
+        if (!hasTrustedBoxes(r.frage)) return;
+        const fb = r.frage.review.boundingBoxes[0];
+        const key = `${fieldValue(r.exerciseNumber)}|${fieldValue(r.exerciseType)}|${r.frage.review.page}|${Math.round(fb[1] * 100)}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(i);
+      });
+      for (const f of ['frage', 'antwort', 'fall']) {
+        const samples = new Map();   // exercise|type|ordinal -> { x0: [], x1: [] }
+        const members = [];
+        for (const [gkey, idxs] of groups) {
+          const [ex, type] = gkey.split('|');
+          idxs.sort((a, b) => a - b).forEach((i, k) => {
+            const sk = `${ex}|${type}|${k}`;
+            members.push({ i, sk, idxs });
+            const box = answers[i][f];
+            if (isUsableAnswerBox(box) && !box.review.inferred) {
+              if (!samples.has(sk)) samples.set(sk, { x0: [], x1: [] });
+              samples.get(sk).x0.push(box.review.boundingBoxes[0][0]);
+              samples.get(sk).x1.push(box.review.boundingBoxes[0][2]);
+            }
+          });
+        }
+        for (const m of members) {
+          const r = answers[m.i];
+          const box = r[f];
+          if (!hasValue(box) || hasTrustedBoxes(box)) continue;
+          const s = samples.get(m.sk);
+          if (!s || !s.x0.length) continue;
+          const sib = m.idxs.map(j => answers[j][f]).find(b => isUsableAnswerBox(b) && !b.review.inferred);
+          const yb = sib ? sib.review.boundingBoxes[0] : r.frage.review.boundingBoxes[0];
+          gridPositions.set(`${m.i}:${f}`, {
+            value: fieldValue(box),
+            review: { page: r.frage.review.page, boundingBoxes: [[med(s.x0), yb[1], med(s.x1), yb[3]]], confidence: 'medium', inferred: true }
+          });
+        }
+      }
+    }
+
     // Which pools actually produced a verdict. Used to tell a pool that scored
     // zero because the student left it BLANK from one that is doubtful - see
     // the warned-pool block below. Same key construction as node 21.
@@ -1194,7 +1251,11 @@ app.post('/annotate', async (req, res) => {
       // Swap in the question's box BEFORE gradedBox is read from it, so the
       // row below comes from the question and everything downstream follows
       // without knowing the difference.
-      if (gradedUnusable && hasTrustedBoxes(frageField)) {
+      const gridKey = `${verdict.answerIndex}:${posField}`;
+      if (gradedUnusable && !MARGIN_MODE && gridPositions.has(gridKey)) {
+        field = gridPositions.get(gridKey);
+        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the answer's box was uncertain; placed in its table column (learned from the other rows) on its own sentence`);
+      } else if (gradedUnusable && hasTrustedBoxes(frageField)) {
         const why = hasBoxes(gradedField) ? 'low confidence' : 'no box of its own';
         field = frageField;
         if (MARGIN_MODE) {
@@ -1470,9 +1531,13 @@ app.post('/annotate', async (req, res) => {
         // Several on-item marks moved to the margin on one row (three on one
         // row of Kurztest A5) were drawn on top of each other. Side by side.
         if (withheldToMargin) {
-          const rowKey = `${pageIndex}|${Math.round(y1 * 150)}`;
-          const k = marginRowUse.get(rowKey) || 0;
-          marginRowUse.set(rowKey, k + 1);
+          // Same LINE by distance, not by rounding: two marks 2.6pt apart fell
+          // into different rounding bins and were drawn on top of each other
+          // (Kurztest A3, Aufgabe 4, "mit" under "Bei", 23.09.2026).
+          const rowsOnPage = marginRowUse.get(pageIndex) || [];
+          const k = rowsOnPage.filter(yy => Math.abs(yy - y1) < lineHeightNorm * 0.8).length;
+          rowsOnPage.push(y1);
+          marginRowUse.set(pageIndex, rowsOnPage);
           const visualWm = (rotationAngle === 90 || rotationAngle === 270) ? height : width;
           x1 -= k * (MARK_FONT_SIZE * 4.6) / visualWm;
         }
