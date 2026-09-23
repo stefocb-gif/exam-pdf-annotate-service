@@ -936,7 +936,6 @@ app.post('/annotate', async (req, res) => {
     // Marks that were not placed the ordinary way - reported so the
     // workflow can surface them rather than leaving them to be noticed.
     const marginWithheld = [];   // Grammatik: value shown in the margin, not on the item
-    const marginRowUse = new Map();   // "page|row" -> amber margin marks already on that row
     const rowRecovered = [];     // margin mode: row taken from the question box
     const positionWarnings = [];
     const lastMarkPosByPage = {};
@@ -1185,17 +1184,6 @@ app.post('/annotate', async (req, res) => {
           withheldToMargin = true;
           positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the answer's box had ${why}, so the mark is NOT placed on the item; its value is drawn in amber in the right margin, on the row the question gives`);
         }
-      } else if (gradedUnusable && !MARGIN_MODE && hasBoxes(gradedField)) {
-        // The question's box is low too, so there is no trusted row to borrow -
-        // and until 23.09.2026 the mark was then dropped WITHOUT a trace (Kurztest
-        // A3, Aufgabe 3: five of eleven marks). But the answer's own low box
-        // still says which LINE it is on: on Aufgabe 3 the low boxes are
-        // whole-line bands (x 0.08-0.93), wrong about the word, right about the
-        // line. Nitai's rule stands - nothing is drawn ON a low box - but the
-        // value goes in amber into the right margin on that line, so the page
-        // says "look here" instead of nothing.
-        withheldToMargin = true;
-        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the answer's box and its question's box both had low confidence, so the mark is NOT placed on the item; its value is drawn in amber in the right margin, on the line its own box gives`);
       }
 
       if (!hasBoxes(field)) {
@@ -1213,7 +1201,7 @@ app.post('/annotate', async (req, res) => {
       // documents processed before this field existed) the same as "high"
       // so nothing already working breaks.
       const confidence = field.review.confidence;
-      if (confidence === 'low' && !withheldToMargin) {
+      if (confidence === 'low') {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (low confidence coordinate - not trustworthy, skipped per Nitai's recommendation)`);
         continue;
       }
@@ -1459,15 +1447,6 @@ app.post('/annotate', async (req, res) => {
         x1 = RIGHT_MARGIN_X_FRACTION;
         y1 = rowAnchorY(gradedBox, lineHeightNorm);
         rightAlignMark = true;   // the label must END at the margin, not start there
-        // Several withheld marks on one line (three on one row of Kurztest A5)
-        // were drawn on top of each other. Lay them out leftwards instead.
-        if (withheldToMargin) {
-          const rowKey = `${pageIndex}|${Math.round(y1 * 150)}`;
-          const k = marginRowUse.get(rowKey) || 0;
-          marginRowUse.set(rowKey, k + 1);
-          const visualWm = (rotationAngle === 90 || rotationAngle === 270) ? height : width;
-          x1 -= k * (MARK_FONT_SIZE * 4.6) / visualWm;
-        }
       }
 
       let tfColumnPlaced = false;
