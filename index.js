@@ -34,6 +34,9 @@ const MARGIN_MARK_FONT_SIZE = MARK_FONT_SIZE + 1;
 // Per-exercise subtotals are drawn larger and bold so they read as a
 // summary line rather than as just another per-answer mark.
 const SUBTOTAL_FONT_SIZE = 12;
+// The line under a subtotal whose pool carries a note (Change 46): small, so
+// it fits the Grammatik left-edge column, and never a number.
+const SUBTOTAL_NOTE_FONT_SIZE = 8;
 
 // The header total is drawn bold and slightly larger than the subtotals, so
 // it stands out at the top of page 1.
@@ -2065,6 +2068,27 @@ app.post('/annotate', async (req, res) => {
         // warning too, but it is a settled zero — it stays blue.
         const subtotalColor = warnedPools.has(String(sub.key)) ? rgb(0.85, 0.45, 0) : rgb(0, 0, 0.6);
         drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, subtotalColor, rotationAngle, labelFontBold);
+
+        // A NOTE IS NOT A WARNING (Change 46, 25.09.2026). The student struck
+        // something out in this pool and DocuPipe flagged it (correctionStatus).
+        // The pool is graded as usual - marks drawn, subtotal blue, total and
+        // grade kept - and a small amber line under the subtotal asks the
+        // teacher to glance at it. Unlike sub.warning it never enters
+        // warnedPools, so it cannot withhold anything.
+        if (sub.note) {
+          const noteText = String(sub.note);
+          let { x: nx, y: ny } = nudgeVisualDown(subX, subY, SUBTOTAL_FONT_SIZE + 1, rotationAngle);
+          if (subtotalsRight) {
+            // right-aligned under the subtotal, like the subtotal itself
+            const rad = (rotationAngle * Math.PI) / 180;
+            const d = labelFontBold.widthOfTextAtSize(subtotalText, SUBTOTAL_FONT_SIZE) - labelFont.widthOfTextAtSize(noteText, SUBTOTAL_NOTE_FONT_SIZE);
+            nx += d * Math.cos(rad);
+            ny += d * Math.sin(rad);
+          }
+          drawLabel(page, noteText, nx, ny, SUBTOTAL_NOTE_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFont);
+          // keep a second subtotal on this row clear of the note
+          subtotalsDrawnPerRow[firstRowIndex] += 1;
+        }
       }
     }
 
@@ -2227,6 +2251,26 @@ app.post('/annotate', async (req, res) => {
       }
     }
 
+    // Change 46: one amber line above the header names every pool with a
+    // student correction, so the teacher knows where to look. Total and grade
+    // stay drawn. Below the manual-check note when both are present.
+    const correctionPools = Array.isArray(subtotals)
+      ? [...new Set(subtotals.filter(s => s && s.note).map(s => String(s.key)))].sort((a, b) => a.localeCompare(b, 'de', { numeric: true }))
+      : [];
+    if (correctionPools.length && pages[0]) {
+      const text = `Korrektur des Schülers erkannt: Aufgabe${correctionPools.length > 1 ? 'n' : ''} ${correctionPools.join(', ')} – bitte kurz prüfen`;
+      const page = pages[0];
+      const { width, height } = page.getSize();
+      const rotationAngle = page.getRotation().angle;
+      const topY = NOTE_TOP_Y + (manualCheckPools.length ? 0.022 : 0);
+      let { x, y } = toRawCoords(RIGHT_MARGIN_X_FRACTION, topY, width, height, rotationAngle);
+      const w = labelFontBold.widthOfTextAtSize(text, SUBTOTAL_NOTE_FONT_SIZE + 2);
+      const rad = (rotationAngle * Math.PI) / 180;
+      x -= w * Math.cos(rad);
+      y -= w * Math.sin(rad);
+      drawLabel(page, text, x, y, SUBTOTAL_NOTE_FONT_SIZE + 2, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold);
+    }
+
     const outBytes = await pdfDoc.save();
 
     res.json({
@@ -2238,6 +2282,8 @@ app.post('/annotate', async (req, res) => {
       // Point pools left unmarked on purpose, for the workflow to surface.
       // Non-empty means no total and no grade were drawn either.
       manualCheckPools,
+      // Pools with a student correction (Change 46): graded, only noted.
+      correctionPools,
       // Marks whose placement was degraded rather than refused outright.
       marginWithheld,
       rowRecovered
