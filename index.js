@@ -65,6 +65,10 @@ const SUBTOTAL_LEFT_INSET = 2;
 const NOTE_TOP_Y = 0.045;
 
 const RIGHT_MARGIN_X_FRACTION = 0.94;
+// A margin mark pushed right by writing that reaches the margin keeps this
+// much air after the writing, and this much before the page edge (points).
+const MARGIN_CLEARANCE_PT = 5;
+const MARGIN_EDGE_PT = 3;
 
 // Exam PDFs with images can be large - raise the body size limit.
 app.use(express.json({ limit: '25mb' }));
@@ -816,6 +820,8 @@ app.get('/', (req, res) => {
 app.post('/annotate', async (req, res) => {
   try {
     const { pdfBase64, reviewData, verdicts, totalPointsAwarded, totalPointsPossible, subtotals, gradeRounding, bonusPoints, examType } = req.body;
+    // Per-template drawing switches, set from the app's template draft.
+    const annotationOptions = (req.body.annotationOptions && typeof req.body.annotationOptions === 'object') ? req.body.annotationOptions : {};
 
     // ONE service, TWO placement strategies - merged 21.09.2026.
     //
@@ -1767,7 +1773,10 @@ app.post('/annotate', async (req, res) => {
 
       pendingDraws.push({
         pool: poolKey, verdict, pointsLabel, withheld: withheldToMargin, recovered: rowFromQuestion,
-        draw: () => drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont)
+        draw: () => drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont),
+        // Kept for the per-row sum below (margin mode only): the row in
+        // normalized units and how far this row's own writing reaches right.
+        row: (MARGIN_MODE && !withheldToMargin) ? { page, pageIndex, y: y1, lineHeightNorm, rotationAngle, width, height, reach: gradedBox[2] } : null
       });
       // An uncertain mark (drawn in the margin on its question's row) does NOT
       // flag its pool: the value was read and graded, only its exact position
@@ -1779,12 +1788,60 @@ app.post('/annotate', async (req, res) => {
 
     for (const pool of unplacedPools) warnedPools.add(pool);
     manualCheckPools = [...warnedPools].sort();
+
+    // ONE MARK PER ROW (margin mode, 30.09.2026). Every mark of a row resolves
+    // to the same right-margin spot, so a row with several graded blanks
+    // (Chemie 7a: three coefficients of one equation; 2a+2b: the cross and its
+    // reason; the Löschmassnahme table: measure and side) was drawn as a pile
+    // of labels on top of each other. The teacher's rule: add them up and show
+    // the row's sum, "1P" rather than "0.5P" twice. Same LINE by distance, as
+    // for the withheld marks above. A mark whose pool is flagged is left out,
+    // since it is not drawn at all. annotationOptions.sumRowMarks = false
+    // restores one label per mark.
+    if (MARGIN_MODE && annotationOptions.sumRowMarks !== false) {
+      const rows = [];
+      for (const d of pendingDraws) {
+        if (!d.row || warnedPools.has(d.pool)) continue;
+        const v = d.verdict;
+        if (v.pointsPossible === undefined || v.pointsPossible === null) continue;
+        let g = rows.find(r => r.pageIndex === d.row.pageIndex && Math.abs(r.y - d.row.y) < d.row.lineHeightNorm * 0.8);
+        if (!g) { g = { pageIndex: d.row.pageIndex, y: d.row.y, members: [] }; rows.push(g); }
+        g.members.push(d);
+        g.y = Math.min(g.y, d.row.y);
+      }
+      for (const g of rows) {
+        const first = g.members[0];
+        const { page, rotationAngle, width, height } = first.row;
+        const awarded = g.members.reduce((s, d) => s + Number(d.verdict.pointsAwarded ?? 0), 0);
+        const possible = g.members.reduce((s, d) => s + Number(d.verdict.pointsPossible), 0);
+        const allCorrect = g.members.every(d => d.verdict.isCorrect);
+        const label = `${fmtPoints(awarded)}/${fmtPoints(possible)}P`;
+        const color = allCorrect ? rgb(0, 0.6, 0) : rgb(0.8, 0, 0);
+        // Right-aligned at the margin line - unless the row's own writing
+        // runs into that spot (Chemie 4b: a reason written across the whole
+        // line, the label sat on its last word). Then it starts just after the
+        // writing - but only where the whole label fits before the page edge.
+        // Writing that runs to the edge (a Hörverstehen line) leaves no room,
+        // and there the mark stays where it always was.
+        const visualW = (rotationAngle === 90 || rotationAngle === 270) ? height : width;
+        const wNorm = markFont.widthOfTextAtSize(label, markFontSize) / visualW;
+        const reach = Math.max(...g.members.map(d => d.row.reach || 0));
+        let start = RIGHT_MARGIN_X_FRACTION - wNorm;
+        const after = reach + MARGIN_CLEARANCE_PT / visualW;
+        if (after > start && after + wNorm <= 1 - MARGIN_EDGE_PT / visualW) start = after;
+        const { x, y } = toRawCoords(start, g.y, width, height, rotationAngle);
+        for (const d of g.members) d.draw = null;
+        first.draw = () => drawLabel(page, label, x, y, markFontSize, color, rotationAngle, markFont);
+        if (g.members.length > 1) positionWarnings.push(`page ${g.pageIndex + 1}: ${g.members.length} marks on one row drawn as their sum ${label}`);
+      }
+    }
+
     for (const d of pendingDraws) {
       if (warnedPools.has(d.pool)) {
         skipped.push(`answerIndex ${d.verdict.answerIndex}, field ${d.verdict.field} (Aufgabe ${d.pool} is flagged for manual checking - a mark in it could not be placed, so none of its marks are drawn)`);
         continue;
       }
-      d.draw();
+      if (d.draw) d.draw();
       annotatedCount++;
       if (d.withheld) {
         marginWithheld.push(`answerIndex ${d.verdict.answerIndex}, field ${d.verdict.field} (${d.pointsLabel})`);
