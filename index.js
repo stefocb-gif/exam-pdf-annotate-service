@@ -120,6 +120,29 @@ function hasTrustedBoxes(f) {
   return hasBoxes(f) && f.review.confidence !== 'low';
 }
 
+// Margin mode only needs the ROW. When neither the answer's box nor its
+// question's box can be trusted, a sibling on the same printed line can still
+// give it: another answer of the same exercise with the same question text
+// (one equation, several blanks) whose own box is trusted. Chemie 7a, Greta,
+// 04.10.2026: the empty blank before O2 had a low box AND a low question box,
+// the other two blanks of that equation were high on the same line - the one
+// skipped mark flagged all of 7a, so none of its marks and no grade were shown.
+function siblingRowField(answers, index) {
+  const row = answers[index];
+  const text = f => (f && f.value != null ? String(f.value).trim() : '');
+  const question = text(row && row.frage);
+  if (!question) return null;
+  const page = hasBoxes(row.frage) ? row.frage.review.page : null;
+  for (let i = 0; i < answers.length; i++) {
+    const r = answers[i];
+    if (i === index || !r || text(r.frage) !== question || text(r.exerciseNumber) !== text(row.exerciseNumber)) continue;
+    for (const f of [r.antwort, r.fall, r.frage]) {
+      if (hasTrustedBoxes(f) && (page === null || f.review.page === page)) return f;
+    }
+  }
+  return null;
+}
+
 // How tightly a field's x-positions must cluster before we treat them as a
 // real table column (median absolute deviation, in normalized page width),
 // and how far from that column a box must sit before we call it misplaced.
@@ -1392,6 +1415,11 @@ app.post('/annotate', async (req, res) => {
           withheldToMargin = true;
           positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - the answer's box had ${why}, so the mark is NOT placed on the item; its value is drawn in amber in the right margin, on the row the question gives`);
         }
+      } else if (gradedUnusable && MARGIN_MODE && siblingRowField(answers, verdict.answerIndex)) {
+        // see siblingRowField: the row from another blank of the same printed line
+        field = siblingRowField(answers, verdict.answerIndex);
+        rowFromQuestion = true;
+        positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - neither the answer's nor the question's box could be trusted; in margin mode the row was taken from another answer of the same question on the same line`);
       }
 
       if (!hasBoxes(field)) {
