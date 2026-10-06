@@ -2234,9 +2234,22 @@ app.post('/annotate', async (req, res) => {
     const GRADE_STEP = Number(gradeRounding) > 0 ? Number(gradeRounding) : 0.5;
     const BONUS_POINTS = Number(bonusPoints) || 0;
 
+    // The teacher's own scale (06.10.2026, app «Notenskala anpassen»):
+    // annotationOptions.gradeScale = { full, pass } as fractions of the maximum,
+    // the points for the 6 and for the 4. Two straight lines: 1 to 4 up to the
+    // pass mark, 4 to 6 from there to full marks. Without it (or invalid) the
+    // usual line; full = 1, pass = 0.6 is that same line. The app computes the
+    // same grade (src/grade.js) for its overview.
+    const GS = annotationOptions.gradeScale;
+    const SCALE = GS && Number(GS.full) > 0 && Number(GS.full) <= 1 && Number(GS.pass) > 0 && Number(GS.pass) < Number(GS.full)
+      ? { full: Number(GS.full), pass: Number(GS.pass) } : null;
+
     function computeSwissGrade(awarded, possible) {
       if (!possible) return null;
-      const raw = 1 + 5 * ((Number(awarded) + BONUS_POINTS) / possible);
+      const pts = Number(awarded) + BONUS_POINTS;
+      const raw = SCALE
+        ? (pts >= SCALE.pass * possible ? 4 + 2 * (pts - SCALE.pass * possible) / ((SCALE.full - SCALE.pass) * possible) : 1 + 3 * pts / (SCALE.pass * possible))
+        : 1 + 5 * (pts / possible);
       const rounded = Math.round(raw / GRADE_STEP) * GRADE_STEP;
       return Math.max(1, Math.min(6, rounded));
     }
