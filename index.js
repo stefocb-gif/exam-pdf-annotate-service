@@ -96,6 +96,18 @@ function toRawCoords(x1, y1, rawWidth, rawHeight, rotationAngle) {
   }
 }
 
+// The inverse of toRawCoords: a point in pdf-lib's raw space back to the
+// normalized visual page (0..1, top-left origin), for the mark geometry.
+function fromRawCoords(X, Y, rawWidth, rawHeight, rotationAngle) {
+  switch (rotationAngle) {
+    case 270: return { x: 1 - Y / rawHeight, y: 1 - X / rawWidth };
+    case 90:  return { x: Y / rawHeight, y: X / rawWidth };
+    case 180: return { x: 1 - X / rawWidth, y: Y / rawHeight };
+    case 0:
+    default:  return { x: X / rawWidth, y: 1 - Y / rawHeight };
+  }
+}
+
 // DocuPipe wraps every extracted field as { value, review }. Some places
 // need the plain value (comparing exerciseType/subPart), others need the
 // review block (coordinates). One helper for the value side, used
@@ -886,6 +898,8 @@ app.post('/annotate', async (req, res) => {
     // subtotals go. See CONTAINMENT_BELOW_HEADING_LAYOUT.
     const HEADING_LAYOUT = examTypeKey === 'geschichte';
     const containmentBelow = HEADING_LAYOUT ? CONTAINMENT_BELOW_HEADING_LAYOUT : CONTAINMENT_BELOW;
+    const MARGIN_TASKS = new Set((Array.isArray(annotationOptions.marginTasks) ? annotationOptions.marginTasks : []).map(t => String(t).replace(/\s+/g, '').toLowerCase()));
+    const forcedToMargin = [];
 
     // EXERCISES THE TEACHER HAS TO COUNT HERSELF.
     //
@@ -947,7 +961,7 @@ app.post('/annotate', async (req, res) => {
     // leaving it faintly visible underneath rather than blanking it out.
     // The pad is measured from the real glyph width, so it always fits the
     // text exactly and never over-covers the page.
-    function drawLabel(page, text, x, y, size, color, rotationAngle, font) {
+    function drawLabel(page, text, x, y, size, color, rotationAngle, font, meta) {
       const f = font || labelFont;
       const w = f.widthOfTextAtSize(text, size);
       page.drawRectangle({
@@ -960,7 +974,28 @@ app.post('/annotate', async (req, res) => {
         rotate: degrees(rotationAngle)
       });
       page.drawText(text, { x, y, size, font: f, color, rotate: degrees(rotationAngle) });
+      recordMark(page, text, x - 2, y - 0.22 * size, w + 4, size * 1.18, rotationAngle, meta);
       return w;
+    }
+
+    // MARK GEOMETRY (06.10.2026, «Vorlagen-Prüfung» step 3). Every label is
+    // recorded with its box in the same normalized, visual, top-left
+    // coordinates DocuPipe uses, so the response can say where each mark
+    // landed and what it overlaps. The pad rectangle is the label's extent;
+    // pdf-lib rotates it about its own origin, so its four corners are
+    // rotated here the same way and mapped back through toRawCoords' inverse.
+    const drawnMarks = [];
+    function recordMark(page, text, ox, oy, w, h, rotationAngle, meta) {
+      const pageIndex = pages.indexOf(page);
+      if (pageIndex < 0) return;
+      const { width, height } = page.getSize();
+      const rad = (rotationAngle * Math.PI) / 180, c = Math.cos(rad), s = Math.sin(rad);
+      const corners = [[0, 0], [w, 0], [0, h], [w, h]].map(([u, v]) => fromRawCoords(ox + u * c - v * s, oy + u * s + v * c, width, height, rotationAngle));
+      const xs = corners.map(p => p.x), ys = corners.map(p => p.y);
+      const r4 = n => Math.round(n * 10000) / 10000;
+      drawnMarks.push({ page: pageIndex + 1, box: [r4(Math.min(...xs)), r4(Math.min(...ys)), r4(Math.max(...xs)), r4(Math.max(...ys))],
+        text: String(text).slice(0, 60), kind: (meta && meta.kind) || 'other', task: (meta && meta.task) || null,
+        answerIndex: meta && Number.isInteger(meta.answerIndex) ? meta.answerIndex : null });
     }
 
     let annotatedCount = 0;
@@ -1422,6 +1457,16 @@ app.post('/annotate', async (req, res) => {
         positionWarnings.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} - neither the answer's nor the question's box could be trusted; in margin mode the row was taken from another answer of the same question on the same line`);
       }
 
+      // annotationOptions.marginTasks (06.10.2026): tasks whose on-item marks
+      // covered writing or each other in a template test. The app moves them
+      // here, to the right margin on their row, and tests again - the same
+      // path as a withheld mark, in normal colour, side by side on one row.
+      if (!MARGIN_MODE && !withheldToMargin && MARGIN_TASKS.has(poolKey.toLowerCase())) {
+        if (!hasTrustedBoxes(field) && hasTrustedBoxes(frageField)) field = frageField;
+        withheldToMargin = true;
+        forcedToMargin.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field} (Aufgabe ${poolKey})`);
+      }
+
       if (!hasBoxes(field)) {
         skipped.push(`answerIndex ${verdict.answerIndex}, field ${verdict.field}`);
         continue;
@@ -1801,7 +1846,7 @@ app.post('/annotate', async (req, res) => {
 
       pendingDraws.push({
         pool: poolKey, verdict, pointsLabel, withheld: withheldToMargin, recovered: rowFromQuestion,
-        draw: () => drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont),
+        draw: () => drawLabel(page, pointsLabel, xPos, yTop, markFontSize, color, rotationAngle, markFont, { kind: 'mark', task: poolKey, answerIndex: verdict.answerIndex }),
         // Kept for the per-row sum below (margin mode only): the row in
         // normalized units and how far this row's own writing reaches right.
         row: (MARGIN_MODE && !withheldToMargin) ? { page, pageIndex, y: y1, lineHeightNorm, rotationAngle, width, height, reach: gradedBox[2] } : null
@@ -1859,7 +1904,7 @@ app.post('/annotate', async (req, res) => {
         if (after > start && after + wNorm <= 1 - MARGIN_EDGE_PT / visualW) start = after;
         const { x, y } = toRawCoords(start, g.y, width, height, rotationAngle);
         for (const d of g.members) d.draw = null;
-        first.draw = () => drawLabel(page, label, x, y, markFontSize, color, rotationAngle, markFont);
+        first.draw = () => drawLabel(page, label, x, y, markFontSize, color, rotationAngle, markFont, { kind: 'mark', task: first.pool, answerIndex: first.verdict.answerIndex });
         if (g.members.length > 1) positionWarnings.push(`page ${g.pageIndex + 1}: ${g.members.length} marks on one row drawn as their sum ${label}`);
       }
     }
@@ -2152,7 +2197,7 @@ app.post('/annotate', async (req, res) => {
         // Amber only where the teacher has to look. A blank task carries a
         // warning too, but it is a settled zero — it stays blue.
         const subtotalColor = warnedPools.has(String(sub.key)) ? rgb(0.85, 0.45, 0) : rgb(0, 0, 0.6);
-        drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, subtotalColor, rotationAngle, labelFontBold);
+        drawLabel(page, subtotalText, subX, subY, SUBTOTAL_FONT_SIZE, subtotalColor, rotationAngle, labelFontBold, { kind: 'subtotal', task: String(sub.key) });
 
         // A NOTE IS NOT A WARNING (Change 46, 25.09.2026). The student struck
         // something out in this pool and DocuPipe flagged it (correctionStatus).
@@ -2170,7 +2215,7 @@ app.post('/annotate', async (req, res) => {
             nx += d * Math.cos(rad);
             ny += d * Math.sin(rad);
           }
-          drawLabel(page, noteText, nx, ny, SUBTOTAL_NOTE_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFont);
+          drawLabel(page, noteText, nx, ny, SUBTOTAL_NOTE_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFont, { kind: 'note', task: String(sub.key) });
           // keep a second subtotal on this row clear of the note
           subtotalsDrawnPerRow[firstRowIndex] += 1;
         }
@@ -2242,7 +2287,7 @@ app.post('/annotate', async (req, res) => {
         const rotationAngle = page.getRotation().angle;
         const [x1, y1] = field.review.boundingBoxes[0];
         const { x, y } = toRawCoords(x1, y1, width, height, rotationAngle);
-        drawLabel(page, text, x, y + (yNudge || 0), HEADER_FONT_SIZE, rgb(0, 0, 0.7), rotationAngle, labelFontBold);
+        drawLabel(page, text, x, y + (yNudge || 0), HEADER_FONT_SIZE, rgb(0, 0, 0.7), rotationAngle, labelFontBold, { kind: 'header' });
         return true;
       }
 
@@ -2276,7 +2321,7 @@ app.post('/annotate', async (req, res) => {
         const rad = (rotationAngle * Math.PI) / 180;
         x -= w * Math.cos(rad);
         y -= w * Math.sin(rad);
-        drawLabel(page, text, x, y, size, color, rotationAngle, labelFontBold);
+        drawLabel(page, text, x, y, size, color, rotationAngle, labelFontBold, { kind: 'grade' });
         return true;
       }
 
@@ -2303,7 +2348,7 @@ app.post('/annotate', async (req, res) => {
           const rad = (rotationAngle * Math.PI) / 180;
           x -= w * Math.cos(rad);
           y -= w * Math.sin(rad);
-          drawLabel(page, noteText, x, y, SUBTOTAL_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold);
+          drawLabel(page, noteText, x, y, SUBTOTAL_FONT_SIZE, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold, { kind: 'note' });
         }
       } else {
         const punkteDrawn = drawAtField(punkteField, scoreText, 0);
@@ -2331,7 +2376,7 @@ app.post('/annotate', async (req, res) => {
           const lastPage = pages[pages.length - 1];
           const lastPageRotation = lastPage.getRotation().angle;
           const { x, y } = toRawCoords(0.05, 0.95, lastPage.getWidth(), lastPage.getHeight(), lastPageRotation);
-          drawLabel(lastPage, `Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, x, y, HEADER_FONT_SIZE, rgb(0, 0, 0), lastPageRotation, labelFontBold);
+          drawLabel(lastPage, `Total: ${scoreText}${gradeText ? ' - Grade: ' + gradeText : ''}`, x, y, HEADER_FONT_SIZE, rgb(0, 0, 0), lastPageRotation, labelFontBold, { kind: 'header' });
         }
       }
     }
@@ -2353,13 +2398,54 @@ app.post('/annotate', async (req, res) => {
       const rad = (rotationAngle * Math.PI) / 180;
       x -= w * Math.cos(rad);
       y -= w * Math.sin(rad);
-      drawLabel(page, text, x, y, SUBTOTAL_NOTE_FONT_SIZE + 2, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold);
+      drawLabel(page, text, x, y, SUBTOTAL_NOTE_FONT_SIZE + 2, rgb(0.85, 0.45, 0), rotationAngle, labelFontBold, { kind: 'note' });
     }
+
+    // GEOMETRY CHECKS (06.10.2026) on what was actually drawn:
+    //   overlap     - two labels cover each other (more than a quarter of the smaller);
+    //   coversText  - a score covers the writing or the printed question of ANOTHER row
+    //                 (its own answer is where an on-item mark belongs);
+    //   offPage     - a label reaches past the page edge.
+    // The app turns these into findings and, on an on-item layout, moves the
+    // task to the margin (annotationOptions.marginTasks) and tests again.
+    const area = b => Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+    const inter = (a, b) => area([Math.max(a[0], b[0]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.min(a[3], b[3])]);
+    const textBoxes = [];
+    (Array.isArray(answers) ? answers : []).forEach((row, i) => {
+      for (const [name, f] of Object.entries(row || {})) {
+        if (!f || typeof f !== 'object' || !f.review || !Array.isArray(f.review.boundingBoxes)) continue;
+        for (const b of f.review.boundingBoxes) if (Array.isArray(b) && b.length === 4) textBoxes.push({ page: f.review.page, box: b, answerIndex: i, field: name, task: String(fieldValue(row.exerciseNumber) ?? '') + String(fieldValue(row.subPart) ?? '').trim().charAt(0) });
+      }
+    });
+    const geometryIssues = [];
+    const issueKeys = new Set();
+    const issue = x => {
+      const k = [x.kind, x.page, x.task, x.other].join('|');
+      if (issueKeys.has(k) || geometryIssues.length >= 60) return;
+      issueKeys.add(k); geometryIssues.push(x);
+    };
+    drawnMarks.forEach((m, i) => {
+      const a = area(m.box);
+      if (!a) return;
+      if (m.box[0] < -0.002 || m.box[1] < -0.002 || m.box[2] > 1.002 || m.box[3] > 1.002) issue({ kind: 'offPage', page: m.page, task: m.task, text: m.text });
+      for (let j = i + 1; j < drawnMarks.length; j++) {
+        const o = drawnMarks[j];
+        if (o.page !== m.page) continue;
+        if (inter(m.box, o.box) > 0.25 * Math.min(a, area(o.box))) issue({ kind: 'overlap', page: m.page, task: m.task, other: o.task, labels: [m.kind, o.kind], text: m.text, otherText: o.text });
+      }
+      if (m.kind !== 'mark' || m.answerIndex === null) return;
+      const covered = textBoxes.find(t => t.page === m.page && t.answerIndex !== m.answerIndex && t.task !== m.task && inter(m.box, t.box) > 0.25 * a);
+      if (covered) issue({ kind: 'coversText', page: m.page, task: m.task, other: covered.task, field: covered.field, text: m.text });
+    });
 
     const outBytes = await pdfDoc.save();
 
     res.json({
       annotatedPdfBase64: Buffer.from(outBytes).toString('base64'),
+      // where every label landed, and what is wrong with it (06.10.2026)
+      marks: drawnMarks.slice(0, 400),
+      geometryIssues,
+      forcedToMargin,
       annotatedCount,
       skipped,
       positionWarnings,
